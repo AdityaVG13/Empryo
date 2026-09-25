@@ -799,16 +799,9 @@ export class RepoMap {
     const wantCloneShape = lineCount <= CLONE_MAX_LINES;
     if (this.treeSitter) {
       try {
-        const parsed = await Promise.race([
-          this.treeSitter.getFileOutline(absPath, { shapeHashes: wantCloneShape }),
-          new Promise<"timeout">((r) => setTimeout(() => r("timeout"), 5_000)),
-        ]);
-        if (parsed === "timeout") {
-          this.onError?.(`Tree-sitter parse timeout (5s): ${relPath}`);
-        } else {
-          outline = parsed ?? null;
-          shapeHashes = parsed?.shapeHashes ?? null;
-        }
+        const parsed = await this.treeSitter.getFileOutline(absPath, { shapeHashes: wantCloneShape });
+        outline = parsed ?? null;
+        shapeHashes = parsed?.shapeHashes ?? null;
       } catch (err) {
         this.onError?.(
           `Tree-sitter parse error on ${relPath}: ${err instanceof Error ? err.message : String(err)}`,
