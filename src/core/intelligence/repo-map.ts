@@ -51,6 +51,86 @@ const TRIGRAM_MAX_FILE_BYTES = 256 * 1024;
 const CLONE_MAX_LINES = 3000;
 const CLONE_MAX_SYMBOLS = 1500;
 
+/** Non-unique btree indexes from initSchema. PK and files.path UNIQUE stay up during bulk ingest. */
+const SCAN_SECONDARY_INDEXES: readonly { name: string; sql: string }[] = [
+  { name: "idx_files_path", sql: "CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)" },
+  {
+    name: "idx_files_pagerank",
+    sql: "CREATE INDEX IF NOT EXISTS idx_files_pagerank ON files(pagerank DESC)",
+  },
+  {
+    name: "idx_symbols_file",
+    sql: "CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id)",
+  },
+  { name: "idx_symbols_name", sql: "CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name)" },
+  {
+    name: "idx_edges_target",
+    sql: "CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_file_id)",
+  },
+  { name: "idx_refs_file", sql: "CREATE INDEX IF NOT EXISTS idx_refs_file ON refs(file_id)" },
+  { name: "idx_refs_name", sql: "CREATE INDEX IF NOT EXISTS idx_refs_name ON refs(name)" },
+  {
+    name: "idx_refs_source",
+    sql: "CREATE INDEX IF NOT EXISTS idx_refs_source ON refs(source_file_id)",
+  },
+  {
+    name: "idx_refs_import",
+    sql: "CREATE INDEX IF NOT EXISTS idx_refs_import ON refs(import_source)",
+  },
+  {
+    name: "idx_ext_imports_pkg",
+    sql: "CREATE INDEX IF NOT EXISTS idx_ext_imports_pkg ON external_imports(package)",
+  },
+  {
+    name: "idx_shape_hashes_file",
+    sql: "CREATE INDEX IF NOT EXISTS idx_shape_hashes_file ON shape_hashes(file_id)",
+  },
+  {
+    name: "idx_shape_hashes_hash",
+    sql: "CREATE INDEX IF NOT EXISTS idx_shape_hashes_hash ON shape_hashes(shape_hash)",
+  },
+  {
+    name: "idx_token_sig_file",
+    sql: "CREATE INDEX IF NOT EXISTS idx_token_sig_file ON token_signatures(file_id)",
+  },
+  {
+    name: "idx_fragments_hash",
+    sql: "CREATE INDEX IF NOT EXISTS idx_fragments_hash ON token_fragments(hash)",
+  },
+  {
+    name: "idx_fragments_file",
+    sql: "CREATE INDEX IF NOT EXISTS idx_fragments_file ON token_fragments(file_id)",
+  },
+  {
+    name: "idx_calls_caller",
+    sql: "CREATE INDEX IF NOT EXISTS idx_calls_caller ON calls(caller_symbol_id)",
+  },
+  {
+    name: "idx_calls_callee",
+    sql: "CREATE INDEX IF NOT EXISTS idx_calls_callee ON calls(callee_symbol_id)",
+  },
+  {
+    name: "idx_calls_callee_file",
+    sql: "CREATE INDEX IF NOT EXISTS idx_calls_callee_file ON calls(callee_file_id)",
+  },
+  {
+    name: "idx_trigrams_file",
+    sql: "CREATE INDEX IF NOT EXISTS idx_trigrams_file ON trigrams(file_id)",
+  },
+  {
+    name: "idx_symbols_moniker",
+    sql: "CREATE INDEX IF NOT EXISTS idx_symbols_moniker ON symbols(moniker)",
+  },
+  {
+    name: "idx_symbols_qname",
+    sql: "CREATE INDEX IF NOT EXISTS idx_symbols_qname ON symbols(qualified_name)",
+  },
+  {
+    name: "idx_semantic_file_name",
+    sql: "CREATE INDEX IF NOT EXISTS idx_semantic_file_name ON semantic_summaries(file_path, symbol_name)",
+  },
+];
+
 interface FileRow {
   id: number;
   path: string;
@@ -540,6 +620,20 @@ export class RepoMap {
     return new Promise((r) => setTimeout(r, 1));
   }
 
+  /** Drop btree secondary indexes so bulk inserts skip per-row index maintenance. */
+  private dropSecondaryIndexes(): void {
+    for (const { name } of SCAN_SECONDARY_INDEXES) {
+      this.db.run(`DROP INDEX IF EXISTS ${name}`);
+    }
+  }
+
+  /** Recreate initSchema btree indexes after the bulk ingest COMMIT. */
+  private createSecondaryIndexes(): void {
+    for (const { sql } of SCAN_SECONDARY_INDEXES) {
+      this.db.run(sql);
+    }
+  }
+
   private async doScan(): Promise<void> {
     this.indexErrors = 0;
     try {
@@ -619,30 +713,42 @@ export class RepoMap {
       if (toIndex.length > 0) {
         this.onProgress?.(0, toIndex.length);
         await this.ensureTreeSitter();
-        for (let i = 0; i < toIndex.length; i++) {
-          const file = toIndex[i];
-          if (file) {
-            try {
-              await this.indexFile(
-                file.absPath,
-                file.relPath,
-                file.mtime,
-                file.language,
-                file.size,
-              );
-            } catch (err) {
-              this.indexErrors++;
-              if (this.indexErrors <= 5) {
-                this.onError?.(
-                  `Failed to index ${file.relPath}: ${err instanceof Error ? err.message : String(err)}`,
+        this.dropSecondaryIndexes();
+        try {
+          this.db.run("BEGIN IMMEDIATE");
+          for (let i = 0; i < toIndex.length; i++) {
+            const file = toIndex[i];
+            if (file) {
+              try {
+                await this.indexFile(
+                  file.absPath,
+                  file.relPath,
+                  file.mtime,
+                  file.language,
+                  file.size,
                 );
+              } catch (err) {
+                this.indexErrors++;
+                if (this.indexErrors <= 5) {
+                  this.onError?.(
+                    `Failed to index ${file.relPath}: ${err instanceof Error ? err.message : String(err)}`,
+                  );
+                }
               }
             }
+            if (i % 5 === 0) {
+              this.onProgress?.(i + 1, toIndex.length);
+              await this.yieldToUi();
+            }
           }
-          if (i % 5 === 0) {
-            this.onProgress?.(i + 1, toIndex.length);
-            await this.yieldToUi();
-          }
+          this.db.run("COMMIT");
+        } catch (err) {
+          try {
+            this.db.run("ROLLBACK");
+          } catch {}
+          throw err;
+        } finally {
+          this.createSecondaryIndexes();
         }
         this.onProgress?.(toIndex.length, toIndex.length);
       }
