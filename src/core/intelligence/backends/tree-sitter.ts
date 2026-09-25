@@ -537,6 +537,15 @@ interface TreeCacheEntry {
   content: string; // content used to parse — invalidate if changed
 }
 
+export interface ShapeHash {
+  name: string;
+  kind: string;
+  line: number;
+  endLine: number;
+  shapeHash: string;
+  nodeCount: number;
+}
+
 export class TreeSitterBackend implements IntelligenceBackend {
   readonly name = "tree-sitter";
   readonly tier = 3;
@@ -834,7 +843,10 @@ export class TreeSitterBackend implements IntelligenceBackend {
     return exports;
   }
 
-  async getFileOutline(file: string): Promise<FileOutline | null> {
+  async getFileOutline(
+    file: string,
+    opts?: { shapeHashes?: boolean },
+  ): Promise<(FileOutline & { shapeHashes?: ShapeHash[] }) | null> {
     // Single parse, extract all data from one tree
     const tree = await this.parseFile(file);
     if (!tree) return null;
@@ -851,6 +863,7 @@ export class TreeSitterBackend implements IntelligenceBackend {
     const imports: ImportInfo[] = [];
     const exports: ExportInfo[] = [];
     const absFile = resolve(file);
+    let hashes: ShapeHash[] | undefined;
 
     try {
       // Extract symbols using the main query
@@ -1092,6 +1105,14 @@ export class TreeSitterBackend implements IntelligenceBackend {
           });
         }
       }
+
+      if (opts?.shapeHashes) {
+        try {
+          hashes = this.shapeHashesFromTree(tree);
+        } catch {
+          hashes = [];
+        }
+      }
     } finally {
       tree.delete();
     }
@@ -1150,6 +1171,7 @@ export class TreeSitterBackend implements IntelligenceBackend {
       symbols,
       imports,
       exports,
+      ...(opts?.shapeHashes ? { shapeHashes: hashes ?? [] } : {}),
     };
   }
 
@@ -1340,47 +1362,34 @@ export class TreeSitterBackend implements IntelligenceBackend {
     }
   }
 
-  async getShapeHashes(file: string): Promise<Array<{
-    name: string;
-    kind: string;
-    line: number;
-    endLine: number;
-    shapeHash: string;
-    nodeCount: number;
-  }> | null> {
+  private shapeHashesFromTree(tree: TSTree): ShapeHash[] {
+    const nodes: Array<{ node: TSNode; name: string; kind: string }> = [];
+    this.collectHashableNodes(tree.rootNode, nodes, 0);
+    if (nodes.length === 0) return [];
+
+    const results: ShapeHash[] = [];
+    for (const { node, name, kind } of nodes) {
+      const serialized = this.serializeShape(node, 0);
+      const hash = Bun.hash(serialized).toString(16);
+      const nodeCount = this.countNodes(node, 0);
+      results.push({
+        name,
+        kind,
+        line: node.startPosition.row + 1,
+        endLine: node.endPosition.row + 1,
+        shapeHash: hash,
+        nodeCount,
+      });
+    }
+    return results;
+  }
+
+  async getShapeHashes(file: string): Promise<ShapeHash[] | null> {
     const tree = await this.parseFile(file);
     if (!tree) return null;
 
     try {
-      const nodes: Array<{ node: TSNode; name: string; kind: string }> = [];
-      this.collectHashableNodes(tree.rootNode, nodes, 0);
-
-      if (nodes.length === 0) return [];
-
-      const results: Array<{
-        name: string;
-        kind: string;
-        line: number;
-        endLine: number;
-        shapeHash: string;
-        nodeCount: number;
-      }> = [];
-
-      for (const { node, name, kind } of nodes) {
-        const serialized = this.serializeShape(node, 0);
-        const hash = Bun.hash(serialized).toString(16);
-        const nodeCount = this.countNodes(node, 0);
-        results.push({
-          name,
-          kind,
-          line: node.startPosition.row + 1,
-          endLine: node.endPosition.row + 1,
-          shapeHash: hash,
-          nodeCount,
-        });
-      }
-
-      return results;
+      return this.shapeHashesFromTree(tree);
     } finally {
       tree.delete();
     }

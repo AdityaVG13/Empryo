@@ -789,16 +789,18 @@ export class RepoMap {
     }
 
     let outline: import("./types.js").FileOutline | null = null;
+    let shapeHashes: import("./backends/tree-sitter.js").ShapeHash[] | null = null;
     if (this.treeSitter) {
       try {
         const parsed = await Promise.race([
-          this.treeSitter.getFileOutline(absPath),
+          this.treeSitter.getFileOutline(absPath, { shapeHashes: true }),
           new Promise<"timeout">((r) => setTimeout(() => r("timeout"), 5_000)),
         ]);
         if (parsed === "timeout") {
           this.onError?.(`Tree-sitter parse timeout (5s): ${relPath}`);
         } else {
           outline = parsed ?? null;
+          shapeHashes = parsed?.shapeHashes ?? null;
         }
       } catch (err) {
         this.onError?.(
@@ -990,22 +992,20 @@ export class RepoMap {
         this.extractAstSummaries(fileId, relPath, outline.symbols, exportedNames, lines, mtime);
       }
 
-      if (this.treeSitter) {
+      if (shapeHashes && shapeHashes.length > 0) {
+        const hashes = shapeHashes;
         try {
-          const hashes = await this.treeSitter.getShapeHashes(absPath);
-          if (hashes && hashes.length > 0) {
-            const insertHash = this.db.prepare(
-              "INSERT INTO shape_hashes (file_id, name, kind, line, end_line, shape_hash, node_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            );
-            const hashTx = this.db.transaction(() => {
-              for (const h of hashes) {
-                insertHash.run(fileId, h.name, h.kind, h.line, h.endLine, h.shapeHash, h.nodeCount);
-              }
-            });
-            hashTx();
-          }
+          const insertHash = this.db.prepare(
+            "INSERT INTO shape_hashes (file_id, name, kind, line, end_line, shape_hash, node_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          );
+          const hashTx = this.db.transaction(() => {
+            for (const h of hashes) {
+              insertHash.run(fileId, h.name, h.kind, h.line, h.endLine, h.shapeHash, h.nodeCount);
+            }
+          });
+          hashTx();
         } catch {
-          // skip shape hashing on parse error
+          // skip shape hashing on insert error
         }
       }
 

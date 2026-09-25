@@ -90,4 +90,36 @@ export class Beta {}
     expect(outline2).toEqual(outline1);
     expect(outline1?.symbols.some((s) => s.name === "foo")).toBe(true);
   });
+
+  it("reuses one parse tree for outline + shape hashes", async () => {
+    const f = writeTemp(
+      "shape.ts",
+      `export function alpha(n: number): number {
+  let acc = 0;
+  for (let i = 0; i < n; i++) {
+    if (i % 2 === 0) {
+      acc += i;
+    } else {
+      acc -= i;
+    }
+  }
+  if (acc < 0) {
+    return -acc;
+  }
+  return acc;
+}
+`,
+    );
+
+    const combined = await backend.getFileOutline(f, { shapeHashes: true });
+    const standalone = await backend.getShapeHashes(f);
+    const plain = await backend.getFileOutline(f);
+
+    expect(combined?.symbols).toEqual(plain?.symbols);
+    expect(combined?.imports).toEqual(plain?.imports);
+    expect(combined?.exports).toEqual(plain?.exports);
+    expect("shapeHashes" in (plain ?? {})).toBe(false);
+    expect(combined?.shapeHashes).toEqual(standalone);
+    expect((combined?.shapeHashes?.length ?? 0) + (standalone?.length ?? 0)).toBeGreaterThan(0);
+  });
 });
