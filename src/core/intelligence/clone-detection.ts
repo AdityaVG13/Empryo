@@ -110,19 +110,55 @@ export function tokenize(source: string): string[] {
 const NUM_HASHES = 128;
 const SHINGLE_K = 3;
 
+// Odd a,b so h_i(x) = a_i*x + b_i is a bijection mod 2^32. Fixed seed, not RNG.
+const HASH_A = new Uint32Array(NUM_HASHES);
+const HASH_B = new Uint32Array(NUM_HASHES);
+{
+  let seed = 0xa5f2c91d;
+  const next = (): number => {
+    seed = (seed + 0x9e3779b9) >>> 0;
+    let z = seed;
+    z = Math.imul(z ^ (z >>> 16), 0x85ebca6b);
+    z = Math.imul(z ^ (z >>> 13), 0xc2b2ae35);
+    return (z ^ (z >>> 16)) >>> 0;
+  };
+  for (let i = 0; i < NUM_HASHES; i++) {
+    HASH_A[i] = next() | 1;
+    HASH_B[i] = next() | 1;
+  }
+}
+
+function hashTokensU32(tokens: string[]): Uint32Array {
+  const n = tokens.length;
+  const out = new Uint32Array(n);
+  for (let i = 0; i < n; i++) {
+    out[i] = Bun.hash.xxHash32(tokens[i] as string) >>> 0;
+  }
+  return out;
+}
+
+function mix3(a: number, b: number, c: number): number {
+  let h = a;
+  h = Math.imul(h, 0x9e3779b1) ^ b;
+  h = Math.imul(h, 0x9e3779b1) ^ c;
+  h = Math.imul(h ^ (h >>> 16), 0x85ebca6b);
+  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
 export function computeMinHash(tokens: string[]): Uint32Array | null {
   if (tokens.length < SHINGLE_K + 2) return null;
 
   const sig = new Uint32Array(NUM_HASHES);
   sig.fill(0xffffffff);
 
+  const th = hashTokensU32(tokens);
   const shingleCount = tokens.length - SHINGLE_K + 1;
   for (let s = 0; s < shingleCount; s++) {
-    const shingle = `${tokens[s]}\0${tokens[s + 1]}\0${tokens[s + 2]}`;
-
-    for (let h = 0; h < NUM_HASHES; h++) {
-      const v = Number(BigInt(Bun.hash(`${String(h)}\x01${shingle}`)) & 0xffffffffn);
-      if (v < (sig[h] as number)) sig[h] = v;
+    const x = mix3(th[s] as number, th[s + 1] as number, th[s + 2] as number);
+    for (let i = 0; i < NUM_HASHES; i++) {
+      const v = (Math.imul(HASH_A[i] as number, x) + (HASH_B[i] as number)) >>> 0;
+      if (v < (sig[i] as number)) sig[i] = v;
     }
   }
 
@@ -148,12 +184,17 @@ interface FragmentHash {
 export function computeFragmentHashes(tokens: string[]): FragmentHash[] {
   if (tokens.length < MIN_FRAGMENT_TOKENS) return [];
 
+  const th = hashTokensU32(tokens);
   const results: FragmentHash[] = [];
   const windowCount = tokens.length - FRAGMENT_WINDOW + 1;
   for (let i = 0; i < windowCount; i++) {
-    const window = tokens.slice(i, i + FRAGMENT_WINDOW).join("\0");
-    const hash = Bun.hash(window).toString(16);
-    results.push({ hash, tokenOffset: i });
+    let h = 0;
+    for (let j = 0; j < FRAGMENT_WINDOW; j++) {
+      h = Math.imul(h, 0x9e3779b1) ^ (th[i + j] as number);
+    }
+    h = Math.imul(h ^ (h >>> 16), 0x85ebca6b);
+    h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+    results.push({ hash: ((h ^ (h >>> 16)) >>> 0).toString(16), tokenOffset: i });
   }
 
   return results;
