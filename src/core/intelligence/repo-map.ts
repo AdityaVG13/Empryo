@@ -135,6 +135,8 @@ export class RepoMap {
   private indexErrors = 0;
   /** File paths included in the last render() output — used by ContextManager for diff detection. */
   lastRenderedPaths: string[] = [];
+  /** Packed-trigram → posting-list size. Hydrated once, then maintained on insert/delete. */
+  private trigramPostingCounts: Map<number, number> | null = null;
 
   constructor(cwd: string) {
     this.cwd = cwd;
@@ -595,6 +597,8 @@ export class RepoMap {
           for (const p of stale) deleteFile.run(p);
         });
         tx();
+        // CASCADE dropped trigram postings — counts are stale until rehydrated.
+        this.trigramPostingCounts = null;
       } else if (stale.length > 0) {
         this.onError?.(
           `Skipped removing ${String(stale.length)} files — looks like a file listing error (${String(Math.round(staleRatio * 100))}% stale). Use /repo-map → [X] clear to force.`,
@@ -763,7 +767,7 @@ export class RepoMap {
         this.db.query("DELETE FROM shape_hashes WHERE file_id = ?").run(existing.id);
         this.db.query("DELETE FROM token_signatures WHERE file_id = ?").run(existing.id);
         this.db.query("DELETE FROM token_fragments WHERE file_id = ?").run(existing.id);
-        this.db.query("DELETE FROM trigrams WHERE file_id = ?").run(existing.id);
+        this.forgetFileTrigrams(existing.id);
         this.db
           .query("DELETE FROM edges WHERE source_file_id = ? OR target_file_id = ?")
           .run(existing.id, existing.id);
@@ -5129,6 +5133,7 @@ export class RepoMap {
     this.db.run("DELETE FROM refs");
     this.db.run("DELETE FROM symbols");
     this.db.run("DELETE FROM files");
+    this.trigramPostingCounts = null;
     this.rebuildFts();
     this.ready = false;
     this.scanPromise = null;
@@ -5314,6 +5319,40 @@ export class RepoMap {
     };
   }
 
+  /** Hydrate posting counts once from SQLite; later inserts/deletes keep the map in sync. */
+  private ensureTrigramPostingCounts(): Map<number, number> {
+    if (this.trigramPostingCounts) return this.trigramPostingCounts;
+    const counts = new Map<number, number>();
+    for (const row of this.db
+      .query<{ trigram: number; c: number }, []>(
+        "SELECT trigram, COUNT(*) AS c FROM trigrams GROUP BY trigram",
+      )
+      .all()) {
+      counts.set(row.trigram, row.c);
+    }
+    this.trigramPostingCounts = counts;
+    return counts;
+  }
+
+  /** Drop one file's postings and decrement the in-memory counts when they exist. */
+  private forgetFileTrigrams(fileId: number): void {
+    const counts = this.trigramPostingCounts;
+    if (counts) {
+      const rows = this.db
+        .query<{ trigram: number }, [number]>("SELECT trigram FROM trigrams WHERE file_id = ?")
+        .all(fileId);
+      this.db.query("DELETE FROM trigrams WHERE file_id = ?").run(fileId);
+      for (const row of rows) {
+        const n = counts.get(row.trigram);
+        if (n === undefined) continue;
+        if (n <= 1) counts.delete(row.trigram);
+        else counts.set(row.trigram, n - 1);
+      }
+    } else {
+      this.db.query("DELETE FROM trigrams WHERE file_id = ?").run(fileId);
+    }
+  }
+
   /**
    * Populate the trigram index for one file. Caps the number of distinct
    * trigrams stored per file to bound index size; common trigrams that already
@@ -5322,17 +5361,15 @@ export class RepoMap {
   private indexTrigrams(fileId: number, content: string): void {
     const trigrams = extractContentTrigrams(content);
     if (trigrams.size === 0) return;
+    const counts = this.ensureTrigramPostingCounts();
     const insert = this.db.prepare(
       "INSERT OR IGNORE INTO trigrams (trigram, file_id) VALUES (?, ?)",
     );
-    const countFor = this.db.prepare<{ c: number }, [number]>(
-      "SELECT COUNT(*) AS c FROM trigrams WHERE trigram = ?",
-    );
     const tx = this.db.transaction(() => {
       for (const tri of trigrams) {
-        const existing = countFor.get(tri)?.c ?? 0;
-        if (existing >= MAX_POSTINGS_PER_TRIGRAM) continue;
+        if ((counts.get(tri) ?? 0) >= MAX_POSTINGS_PER_TRIGRAM) continue;
         insert.run(tri, fileId);
+        counts.set(tri, (counts.get(tri) ?? 0) + 1);
       }
     });
     tx();
