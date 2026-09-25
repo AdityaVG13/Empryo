@@ -528,8 +528,13 @@ export class RepoMap {
     return this.scanPromise;
   }
 
+  /** Yield to the TUI heartbeat only when a progress listener is attached. */
+  private yieldToUi(): Promise<void> {
+    if (!this.onProgress) return Promise.resolve();
+    return new Promise((r) => setTimeout(r, 1));
+  }
+
   private async doScan(): Promise<void> {
-    const tick = () => new Promise<void>((r) => setTimeout(r, 1));
     this.indexErrors = 0;
     try {
       const collected = await collectFiles(this.cwd);
@@ -630,7 +635,7 @@ export class RepoMap {
           }
           if (i % 5 === 0) {
             this.onProgress?.(i + 1, toIndex.length);
-            await tick();
+            await this.yieldToUi();
           }
         }
         this.onProgress?.(toIndex.length, toIndex.length);
@@ -646,31 +651,31 @@ export class RepoMap {
 
       if (needsPostIndexing) {
         this.onProgress?.(-1, -1); // resolving refs
-        await tick();
+        await this.yieldToUi();
         await this.resolveUnresolvedRefs();
         this.onProgress?.(-1, -1);
-        await tick();
+        await this.yieldToUi();
         await this.resolveIdentifierRefs();
         this.onProgress?.(-2, -2); // call graph
-        await tick();
+        await this.yieldToUi();
         await this.buildCallGraph();
         this.onProgress?.(-3, -3); // edges
-        await tick();
+        await this.yieldToUi();
         await this.buildEdges();
         this.onProgress?.(-4, -4); // test linking + orphans
         this.linkTestFiles();
         this.rescueOrphans();
         this.onProgress?.(-4, -4);
-        await tick();
+        await this.yieldToUi();
         await this.computePageRank();
-        await tick();
+        await this.yieldToUi();
       }
 
       this.onProgress?.(-5, -5); // cochanges
-      await tick();
+      await this.yieldToUi();
       await this.buildCoChanges();
 
-      await tick();
+      await this.yieldToUi();
       this.compactIfNeeded();
       this.ready = true;
       this.onScanComplete?.(true);
@@ -1342,7 +1347,6 @@ export class RepoMap {
    * preventing false positives like matching local variable `formatDate` to an unrelated export.
    */
   private async resolveIdentifierRefs(): Promise<void> {
-    const tick = () => new Promise<void>((r) => setTimeout(r, 1));
     // Step 1: Build a map of symbol name → file_id for symbols exported from exactly one file
     const uniqueExports = this.db
       .query<{ name: string; file_id: number }, []>(
@@ -1396,7 +1400,7 @@ export class RepoMap {
       });
       tx();
       if (i % 2000 === 0) this.onProgress?.(-1, -1); // heartbeat
-      if (i + BATCH < unresolvedIds.length) await tick();
+      if (i + BATCH < unresolvedIds.length) await this.yieldToUi();
     }
   }
 
@@ -1405,7 +1409,6 @@ export class RepoMap {
    * source_file_id = NULL (because the target file hadn't been indexed yet).
    */
   private async resolveUnresolvedRefs(): Promise<void> {
-    const tick = () => new Promise<void>((r) => setTimeout(r, 1));
     const unresolved = this.db
       .query<{ rowid: number; file_id: number; import_source: string }, []>(
         "SELECT rowid, file_id, import_source FROM refs WHERE source_file_id IS NULL AND import_source IS NOT NULL",
@@ -1435,7 +1438,7 @@ export class RepoMap {
       });
       tx();
       if (i % 1000 === 0) this.onProgress?.(-1, -1); // heartbeat
-      if (i + BATCH < unresolved.length) await tick();
+      if (i + BATCH < unresolved.length) await this.yieldToUi();
     }
 
     // Expand export * refs: copy exported symbols from target to re-exporting file
@@ -1489,12 +1492,11 @@ export class RepoMap {
       });
       tx();
       if (!changed) break;
-      await tick();
+      await this.yieldToUi();
     }
   }
 
   private async buildEdges(): Promise<void> {
-    const tick = () => new Promise<void>((r) => setTimeout(r, 1));
     this.db.run("DELETE FROM edges");
 
     const totalFiles =
@@ -1535,7 +1537,7 @@ export class RepoMap {
     for (let i = 0; i < trueImportRows.length; i++) {
       const row = trueImportRows[i] as (typeof trueImportRows)[number];
       addEdge(row.source_file_id, row.target_file_id, Math.sqrt(row.ref_count) * 3, 3);
-      if (i % 500 === 499) await tick();
+      if (i % 500 === 499) await this.yieldToUi();
       if (i % 2000 === 0) this.onProgress?.(-3, -3);
     }
 
@@ -1583,13 +1585,13 @@ export class RepoMap {
       if (!isCompound && row.name.length < 10) w *= 0.1;
       if (row.name.startsWith("_")) w *= 0.1;
       addEdge(row.source_file_id, row.target_file_id, w, 1);
-      if (i % 500 === 499) await tick();
+      if (i % 500 === 499) await this.yieldToUi();
       if (i % 2000 === 0) this.onProgress?.(-3, -3);
     }
 
     // Phase 2: Inferred edges (confidence=1) — unique exports only + BM25 IDF
     this.onProgress?.(-3, -3);
-    await tick();
+    await this.yieldToUi();
 
     // Pre-compute export uniqueness to avoid correlated subquery in the main JOIN
     const uniqueExportNames = new Set<string>();
@@ -1634,7 +1636,7 @@ export class RepoMap {
       if (row.name.startsWith("_")) w *= 0.1;
 
       addEdge(row.source_file_id, row.target_file_id, w, 1);
-      if (i % 500 === 499) await tick();
+      if (i % 500 === 499) await this.yieldToUi();
       if (i % 2000 === 0) this.onProgress?.(-3, -3);
     }
 
@@ -1658,7 +1660,7 @@ export class RepoMap {
       }
     }
 
-    await tick();
+    await this.yieldToUi();
 
     // Barrel passthrough: resolve edges through barrel files to actual sources
     const barrelIds = new Set(
@@ -1741,7 +1743,7 @@ export class RepoMap {
         // database locked — edges will be rebuilt on next flush
       }
       if (i % 2000 === 0) this.onProgress?.(-3, -3);
-      if (i + BATCH < entries.length) await tick();
+      if (i + BATCH < entries.length) await this.yieldToUi();
     }
   }
 
@@ -1936,7 +1938,6 @@ export class RepoMap {
   }
 
   private async computePageRank(personalization?: Map<number, number>): Promise<void> {
-    const tick = () => new Promise<void>((r) => setTimeout(r, 1));
     const files = this.db
       .query<{ id: number; pagerank: number; language: string }, []>(
         "SELECT id, pagerank, language FROM files",
@@ -2039,7 +2040,7 @@ export class RepoMap {
       let delta = 0;
       for (let i = 0; i < n; i++) delta += Math.abs((next[i] ?? 0) - (rank[i] ?? 0));
       [rank, next] = [next, rank];
-      if (iter % 5 === 4) await tick();
+      if (iter % 5 === 4) await this.yieldToUi();
       if (delta < 1e-6) break;
     }
 
@@ -2223,7 +2224,6 @@ export class RepoMap {
     const pairCounts = new Map<string, number>();
     const commits = logOutput.split("---COMMIT---").filter((s) => s.trim());
 
-    const tick = () => new Promise<void>((r) => setTimeout(r, 1));
     for (let ci = 0; ci < commits.length; ci++) {
       const commit = commits[ci] as string;
       const files = commit
@@ -2243,7 +2243,7 @@ export class RepoMap {
       }
       if (ci % 50 === 0) {
         this.onProgress?.(-5, -5);
-        await tick(); // yield so heartbeat can be delivered
+        await this.yieldToUi(); // yield so heartbeat can be delivered
       }
     }
 
@@ -2946,7 +2946,6 @@ export class RepoMap {
    * For each function, checks which imported names appear within its body lines.
    */
   private async buildCallGraph(): Promise<void> {
-    const tick = () => new Promise<void>((r) => setTimeout(r, 1));
     const regexCache = new Map<string, RegExp>();
     this.db.run("DELETE FROM calls");
 
@@ -2973,7 +2972,7 @@ export class RepoMap {
           `failed to read ${file.path} for call graph: ${e instanceof Error ? e.message : String(e)}`,
         );
       }
-      if (i % 20 === 19) await tick();
+      if (i % 20 === 19) await this.yieldToUi();
     }
 
     const getImports = this.db.prepare<{ name: string; source_file_id: number }, [number]>(
@@ -3058,7 +3057,7 @@ export class RepoMap {
       });
       tx();
       if (batchStart % (BATCH_SIZE * 10) === 0) this.onProgress?.(-2, -2); // heartbeat
-      if (batchStart + BATCH_SIZE < filesWithImports.length) await tick();
+      if (batchStart + BATCH_SIZE < filesWithImports.length) await this.yieldToUi();
     }
   }
 
@@ -3071,14 +3070,13 @@ export class RepoMap {
   }
 
   private async flushAsync(): Promise<void> {
-    const tick = () => new Promise<void>((r) => setTimeout(r, 1));
     try {
       await this.buildCallGraph();
-      await tick();
+      await this.yieldToUi();
       await this.buildEdges();
       this.linkTestFiles();
       this.rescueOrphans();
-      await tick();
+      await this.yieldToUi();
       await this.computePageRank();
     } catch {
       // DB closed during shutdown or locked — next flush will retry
