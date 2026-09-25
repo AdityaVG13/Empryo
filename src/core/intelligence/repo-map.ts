@@ -45,6 +45,12 @@ import { detectLanguageFromPath } from "./types.js";
  *  Matches ripgrep's --max-filesize=256K cap used by soul_grep. */
 const TRIGRAM_MAX_FILE_BYTES = 256 * 1024;
 
+/** Skip clone shape/token hashing on giant files (the 6 files in this
+ *  tree above 2k lines). Duplicate-function search on a 5k-line AST is
+ *  the serializeShape hotspot; sub-3k-line files still get hashed. */
+const CLONE_MAX_LINES = 3000;
+const CLONE_MAX_SYMBOLS = 1500;
+
 interface FileRow {
   id: number;
   path: string;
@@ -790,10 +796,11 @@ export class RepoMap {
 
     let outline: import("./types.js").FileOutline | null = null;
     let shapeHashes: import("./backends/tree-sitter.js").ShapeHash[] | null = null;
+    const wantCloneShape = lineCount <= CLONE_MAX_LINES;
     if (this.treeSitter) {
       try {
         const parsed = await Promise.race([
-          this.treeSitter.getFileOutline(absPath, { shapeHashes: true }),
+          this.treeSitter.getFileOutline(absPath, { shapeHashes: wantCloneShape }),
           new Promise<"timeout">((r) => setTimeout(() => r("timeout"), 5_000)),
         ]);
         if (parsed === "timeout") {
@@ -809,6 +816,9 @@ export class RepoMap {
       }
     }
     const symbolCount = outline?.symbols.length ?? 0;
+    if (!wantCloneShape || symbolCount > CLONE_MAX_SYMBOLS) {
+      shapeHashes = null;
+    }
 
     if (existing) {
       this.db
@@ -1009,7 +1019,9 @@ export class RepoMap {
         }
       }
 
-      this.extractTokenSignatures(fileId, outline.symbols, content);
+      if (wantCloneShape && symbolCount <= CLONE_MAX_SYMBOLS) {
+        this.extractTokenSignatures(fileId, outline.symbols, content);
+      }
     }
 
     // Refs with resolved source_file_id (from import statements)
