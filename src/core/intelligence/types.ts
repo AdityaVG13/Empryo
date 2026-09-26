@@ -443,7 +443,10 @@ export interface IntelligenceBackend {
     line?: number,
     column?: number,
   ): Promise<TypeInfo | null>;
-  getFileOutline?(file: string): Promise<FileOutline | null>;
+  getFileOutline?(
+    file: string,
+    opts?: { shapeHashes?: boolean; content?: string },
+  ): Promise<FileOutline | null>;
 
   readSymbol?(file: string, symbolName: string, symbolKind?: SymbolKind): Promise<CodeBlock | null>;
 

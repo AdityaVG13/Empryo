@@ -845,10 +845,13 @@ export class TreeSitterBackend implements IntelligenceBackend {
 
   async getFileOutline(
     file: string,
-    opts?: { shapeHashes?: boolean },
+    opts?: { shapeHashes?: boolean; content?: string },
   ): Promise<(FileOutline & { shapeHashes?: ShapeHash[] }) | null> {
+    const source = opts?.content ?? (await this.readFileContent(file));
+    if (!source || source.length > TreeSitterBackend.MAX_FILE_BYTES) return null;
+
     // Single parse, extract all data from one tree
-    const tree = await this.parseFile(file);
+    const tree = await this.parseFile(file, source);
     if (!tree) return null;
 
     const language = this.detectLang(file);
@@ -1119,28 +1122,25 @@ export class TreeSitterBackend implements IntelligenceBackend {
 
     // CommonJS: extract exports from module.exports = { ... } for JS files
     if ((language === "javascript" || language === "typescript") && exports.length === 0) {
-      const content = await this.readFileContent(file);
-      if (content) {
-        const cjsMatch = content.match(/module\.exports\s*=\s*\{([^}]+)\}/);
-        if (cjsMatch?.[1]) {
-          for (const item of cjsMatch[1].split(",")) {
-            const name = item
-              .trim()
-              .split(/\s*[:=]/)[0]
-              ?.trim();
-            if (name && /^\w+$/.test(name)) {
-              const sym = symbols.find((s) => s.name === name);
-              exports.push({
-                name,
-                isDefault: false,
-                kind: sym?.kind ?? "variable",
-                location: sym?.location ?? {
-                  file: absFile,
-                  line: 1,
-                  column: 1,
-                },
-              });
-            }
+      const cjsMatch = source.match(/module\.exports\s*=\s*\{([^}]+)\}/);
+      if (cjsMatch?.[1]) {
+        for (const item of cjsMatch[1].split(",")) {
+          const name = item
+            .trim()
+            .split(/\s*[:=]/)[0]
+            ?.trim();
+          if (name && /^\w+$/.test(name)) {
+            const sym = symbols.find((s) => s.name === name);
+            exports.push({
+              name,
+              isDefault: false,
+              kind: sym?.kind ?? "variable",
+              location: sym?.location ?? {
+                file: absFile,
+                line: 1,
+                column: 1,
+              },
+            });
           }
         }
       }
@@ -1148,19 +1148,16 @@ export class TreeSitterBackend implements IntelligenceBackend {
 
     // Infer exports from visibility conventions for non-TS/JS languages
     if (exports.length === 0 && language !== "typescript" && language !== "javascript") {
-      const content = await this.readFileContent(file);
-      if (content) {
-        const lines = content.split("\n");
-        for (const sym of symbols) {
-          const line = lines[sym.location.line - 1] ?? "";
-          if (isPublicSymbol(sym.name, line, language, file)) {
-            exports.push({
-              name: sym.name,
-              isDefault: false,
-              kind: sym.kind,
-              location: sym.location,
-            });
-          }
+      const lines = source.split("\n");
+      for (const sym of symbols) {
+        const line = lines[sym.location.line - 1] ?? "";
+        if (isPublicSymbol(sym.name, line, language, file)) {
+          exports.push({
+            name: sym.name,
+            isDefault: false,
+            kind: sym.kind,
+            location: sym.location,
+          });
         }
       }
     }
@@ -1466,16 +1463,16 @@ export class TreeSitterBackend implements IntelligenceBackend {
     }
   }
 
-  private async parseFile(file: string): Promise<TSTree | null> {
+  private async parseFile(file: string, content?: string): Promise<TSTree | null> {
     if (!this.parser) return null;
 
     const absPath = resolve(file);
-    const content = await this.readFileContent(absPath);
-    if (!content || content.length > TreeSitterBackend.MAX_FILE_BYTES) return null;
+    const source = content ?? (await this.readFileContent(absPath));
+    if (!source || source.length > TreeSitterBackend.MAX_FILE_BYTES) return null;
 
     // Check tree cache — reuse if content hasn't changed
     const cached = this.treeCache.get(absPath);
-    if (cached && cached.content === content) {
+    if (cached && cached.content === source) {
       // Return a copy since callers delete the tree
       return cached.tree.copy();
     }
@@ -1488,7 +1485,7 @@ export class TreeSitterBackend implements IntelligenceBackend {
     const deadline = performance.now() + TreeSitterBackend.PARSE_BUDGET_MS;
     let tree: TSTree | null;
     try {
-      tree = this.parser.parse(content, null, {
+      tree = this.parser.parse(source, null, {
         progressCallback: () => performance.now() > deadline,
       });
     } catch {
@@ -1508,7 +1505,7 @@ export class TreeSitterBackend implements IntelligenceBackend {
         this.treeCache.delete(firstKey);
       }
     }
-    this.treeCache.set(absPath, { tree: tree.copy(), content });
+    this.treeCache.set(absPath, { tree: tree.copy(), content: source });
 
     return tree;
   }

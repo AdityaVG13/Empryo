@@ -223,6 +223,8 @@ export class RepoMap {
   lastRenderedPaths: string[] = [];
   /** Packed-trigram → posting-list size. Hydrated once, then maintained on insert/delete. */
   private trigramPostingCounts: Map<number, number> | null = null;
+  /** Scan-local file bodies so call-graph can skip a second read of just-indexed files. */
+  private scanContents: Map<string, string> | null = null;
 
   constructor(cwd: string) {
     this.cwd = cwd;
@@ -636,6 +638,7 @@ export class RepoMap {
 
   private async doScan(): Promise<void> {
     this.indexErrors = 0;
+    this.scanContents = new Map();
     try {
       const collected = await collectFiles(this.cwd);
       if (collected.warning) this.onError?.(collected.warning);
@@ -771,6 +774,7 @@ export class RepoMap {
         this.onProgress?.(-2, -2); // call graph
         await this.yieldToUi();
         await this.buildCallGraph();
+        this.scanContents = null;
         this.onProgress?.(-3, -3); // edges
         await this.yieldToUi();
         await this.buildEdges();
@@ -795,6 +799,7 @@ export class RepoMap {
       this.onScanComplete?.(false);
       throw err;
     } finally {
+      this.scanContents = null;
       this.scanPromise = null;
     }
   }
@@ -899,13 +904,17 @@ export class RepoMap {
     } catch {
       return;
     }
+    this.scanContents?.set(relPath, content);
 
     let outline: import("./types.js").FileOutline | null = null;
     let shapeHashes: import("./backends/tree-sitter.js").ShapeHash[] | null = null;
     const wantCloneShape = lineCount <= CLONE_MAX_LINES;
     if (this.treeSitter) {
       try {
-        const parsed = await this.treeSitter.getFileOutline(absPath, { shapeHashes: wantCloneShape });
+        const parsed = await this.treeSitter.getFileOutline(absPath, {
+          shapeHashes: wantCloneShape,
+          content,
+        });
         outline = parsed ?? null;
         shapeHashes = parsed?.shapeHashes ?? null;
       } catch (err) {
@@ -3075,13 +3084,18 @@ export class RepoMap {
     const fileContents = new Map<number, string[]>();
     for (let i = 0; i < filesWithImports.length; i++) {
       const file = filesWithImports[i] as (typeof filesWithImports)[number];
-      try {
-        const content = readFileSync(join(this.cwd, file.path), "utf-8");
-        fileContents.set(file.id, content.split("\n"));
-      } catch (e) {
-        this.onError?.(
-          `failed to read ${file.path} for call graph: ${e instanceof Error ? e.message : String(e)}`,
-        );
+      const cached = this.scanContents?.get(file.path);
+      if (cached !== undefined) {
+        fileContents.set(file.id, cached.split("\n"));
+      } else {
+        try {
+          const content = readFileSync(join(this.cwd, file.path), "utf-8");
+          fileContents.set(file.id, content.split("\n"));
+        } catch (e) {
+          this.onError?.(
+            `failed to read ${file.path} for call graph: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
       }
       if (i % 20 === 19) await this.yieldToUi();
     }
