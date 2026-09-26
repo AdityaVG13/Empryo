@@ -764,6 +764,7 @@ export function createForgeAgent({
       programmaticToolCalling: toolVersions.programmaticToolCalling,
     },
     contextManager,
+    memoryManager: contextManager.getMemoryManager(),
     agentSkills: !disabledTools?.has("skills"),
     webSearchModel,
     repoMap,
