@@ -843,6 +843,36 @@ export class TreeSitterBackend implements IntelligenceBackend {
     return exports;
   }
 
+  /** Load the WASM grammar for this path if missing. No-op on cache hit. */
+  async ensureGrammar(file: string): Promise<void> {
+    await this.loadLanguage(this.grammarKeyForFile(file));
+  }
+
+  /** Load each distinct grammar once. Call before a sync bulk outline loop. */
+  async ensureGrammars(files: string[]): Promise<void> {
+    const keys = new Set<string>();
+    for (const file of files) keys.add(this.grammarKeyForFile(file));
+    for (const key of keys) {
+      if (this.languages.has(key) || this.failedLanguages.has(key)) continue;
+      await this.loadLanguage(key);
+    }
+  }
+
+  /**
+   * Sync outline from in-memory source. Grammar must already be loaded
+   * (`ensureGrammar`). Used by the bulk scan so we do not await per file.
+   */
+  outlineFromContent(
+    file: string,
+    source: string,
+    opts?: { shapeHashes?: boolean },
+  ): (FileOutline & { shapeHashes?: ShapeHash[] }) | null {
+    if (!source || source.length > TreeSitterBackend.MAX_FILE_BYTES) return null;
+    const tree = this.parseFileSync(file, source);
+    if (!tree) return null;
+    return this.outlineFromTree(file, source, tree, opts);
+  }
+
   async getFileOutline(
     file: string,
     opts?: { shapeHashes?: boolean; content?: string },
@@ -850,10 +880,18 @@ export class TreeSitterBackend implements IntelligenceBackend {
     const source = opts?.content ?? (await this.readFileContent(file));
     if (!source || source.length > TreeSitterBackend.MAX_FILE_BYTES) return null;
 
-    // Single parse, extract all data from one tree
-    const tree = await this.parseFile(file, source);
+    await this.loadLanguage(this.grammarKeyForFile(file));
+    const tree = this.parseFileSync(file, source);
     if (!tree) return null;
+    return this.outlineFromTree(file, source, tree, opts);
+  }
 
+  private outlineFromTree(
+    file: string,
+    source: string,
+    tree: TSTree,
+    opts?: { shapeHashes?: boolean },
+  ): (FileOutline & { shapeHashes?: ShapeHash[] }) | null {
     const language = this.detectLang(file);
     const grammarKey = this.grammarKeyForFile(file);
     const tsLang = this.languages.get(grammarKey);
@@ -1466,6 +1504,27 @@ export class TreeSitterBackend implements IntelligenceBackend {
     }
   }
 
+  private parseFileSync(file: string, source: string): TSTree | null {
+    if (!this.parser) return null;
+    if (!source || source.length > TreeSitterBackend.MAX_FILE_BYTES) return null;
+
+    const grammarKey = this.grammarKeyForFile(file);
+    const lang = this.languages.get(grammarKey);
+    if (!lang) return null;
+
+    this.parser.setLanguage(lang);
+    const deadline = performance.now() + TreeSitterBackend.PARSE_BUDGET_MS;
+    try {
+      return this.parser.parse(source, null, {
+        progressCallback: () => performance.now() > deadline,
+      });
+    } catch {
+      this.failedLanguages.add(grammarKey);
+      this.languages.delete(grammarKey);
+      return null;
+    }
+  }
+
   private async parseFile(file: string, content?: string): Promise<TSTree | null> {
     if (!this.parser) return null;
 
@@ -1484,19 +1543,7 @@ export class TreeSitterBackend implements IntelligenceBackend {
     const lang = await this.loadLanguage(grammarKey);
     if (!lang) return null;
 
-    this.parser.setLanguage(lang);
-    const deadline = performance.now() + TreeSitterBackend.PARSE_BUDGET_MS;
-    let tree: TSTree | null;
-    try {
-      tree = this.parser.parse(source, null, {
-        progressCallback: () => performance.now() > deadline,
-      });
-    } catch {
-      // WASM grammar broken at runtime (e.g. ABI mismatch) — blacklist it
-      this.failedLanguages.add(grammarKey);
-      this.languages.delete(grammarKey);
-      return null;
-    }
+    const tree = this.parseFileSync(file, source);
     if (!tree) return null;
 
     if (content !== undefined) return tree;

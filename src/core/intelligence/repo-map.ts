@@ -797,15 +797,19 @@ export class RepoMap {
         this.db.run("DROP TRIGGER IF EXISTS symbols_ad");
         // FK checks on every child INSERT; we already delete children explicitly.
         this.db.run("PRAGMA foreign_keys = OFF");
+        this.db.run("PRAGMA synchronous = OFF");
         this.bulkIngest = true;
         this.hasLlmSummaries = null;
+        if (this.treeSitter) {
+          await this.treeSitter.ensureGrammars(toIndex.map((f) => f.absPath));
+        }
         try {
           this.db.run("BEGIN IMMEDIATE");
           for (let i = 0; i < toIndex.length; i++) {
             const file = toIndex[i];
             if (file) {
               try {
-                await this.indexFile(
+                this.indexFile(
                   file.absPath,
                   file.relPath,
                   file.mtime,
@@ -821,9 +825,9 @@ export class RepoMap {
                 }
               }
             }
-            if (i % 5 === 0) {
-              this.onProgress?.(i + 1, toIndex.length);
-              await this.yieldToUi();
+            if (this.onProgress && i % 5 === 0) {
+              this.onProgress(i + 1, toIndex.length);
+              if (this.onProgress) await this.yieldToUi();
             }
           }
           this.db.run("COMMIT");
@@ -839,6 +843,9 @@ export class RepoMap {
           try {
             this.db.run("PRAGMA foreign_keys = ON");
           } catch {}
+          try {
+            this.db.run("PRAGMA synchronous = NORMAL");
+          } catch {}
         }
         this.onProgress?.(toIndex.length, toIndex.length);
       }
@@ -853,32 +860,32 @@ export class RepoMap {
 
       if (needsPostIndexing) {
         this.onProgress?.(-1, -1); // resolving refs
-        await this.yieldToUi();
+        if (this.onProgress) await this.yieldToUi();
         await this.resolveUnresolvedRefs();
         this.onProgress?.(-1, -1);
-        await this.yieldToUi();
+        if (this.onProgress) await this.yieldToUi();
         await this.resolveIdentifierRefs();
         this.onProgress?.(-2, -2); // call graph
-        await this.yieldToUi();
+        if (this.onProgress) await this.yieldToUi();
         await this.buildCallGraph();
         this.scanContents = null;
         this.onProgress?.(-3, -3); // edges
-        await this.yieldToUi();
+        if (this.onProgress) await this.yieldToUi();
         await this.buildEdges();
         this.onProgress?.(-4, -4); // test linking + orphans
         this.linkTestFiles();
         this.rescueOrphans();
         this.onProgress?.(-4, -4);
-        await this.yieldToUi();
+        if (this.onProgress) await this.yieldToUi();
         await this.computePageRank();
-        await this.yieldToUi();
+        if (this.onProgress) await this.yieldToUi();
       }
 
       this.onProgress?.(-5, -5); // cochanges
-      await this.yieldToUi();
+      if (this.onProgress) await this.yieldToUi();
       await this.buildCoChanges();
 
-      await this.yieldToUi();
+      if (this.onProgress) await this.yieldToUi();
       // Warm scan (nothing indexed, nothing stale) — skip WAL checkpoint I/O.
       if (toIndex.length > 0 || stale.length > 0) this.compactIfNeeded();
       this.ready = true;
@@ -952,7 +959,7 @@ export class RepoMap {
     }
   }
 
-  private async indexFile(
+  private indexFile(
     absPath: string,
     relPath: string,
     mtime: number,
@@ -995,7 +1002,7 @@ export class RepoMap {
     let outline: import("./types.js").FileOutline | null = null;
     if (this.treeSitter) {
       try {
-        outline = await this.treeSitter.getFileOutline(absPath, { content });
+        outline = this.treeSitter.outlineFromContent(absPath, content);
       } catch (err) {
         this.onError?.(
           `Tree-sitter parse error on ${relPath}: ${err instanceof Error ? err.message : String(err)}`,
@@ -1540,7 +1547,7 @@ export class RepoMap {
       });
       tx();
       if (i % 2000 === 0) this.onProgress?.(-1, -1); // heartbeat
-      if (i + BATCH < unresolvedIds.length) await this.yieldToUi();
+      if (i + BATCH < unresolvedIds.length) if (this.onProgress) await this.yieldToUi();
     }
   }
 
@@ -1578,7 +1585,7 @@ export class RepoMap {
       });
       tx();
       if (i % 1000 === 0) this.onProgress?.(-1, -1); // heartbeat
-      if (i + BATCH < unresolved.length) await this.yieldToUi();
+      if (i + BATCH < unresolved.length) if (this.onProgress) await this.yieldToUi();
     }
 
     // Expand export * refs: copy exported symbols from target to re-exporting file
@@ -1632,7 +1639,7 @@ export class RepoMap {
       });
       tx();
       if (!changed) break;
-      await this.yieldToUi();
+      if (this.onProgress) await this.yieldToUi();
     }
   }
 
@@ -1677,7 +1684,7 @@ export class RepoMap {
     for (let i = 0; i < trueImportRows.length; i++) {
       const row = trueImportRows[i] as (typeof trueImportRows)[number];
       addEdge(row.source_file_id, row.target_file_id, Math.sqrt(row.ref_count) * 3, 3);
-      if (i % 500 === 499) await this.yieldToUi();
+      if (i % 500 === 499) if (this.onProgress) await this.yieldToUi();
       if (i % 2000 === 0) this.onProgress?.(-3, -3);
     }
 
@@ -1725,13 +1732,13 @@ export class RepoMap {
       if (!isCompound && row.name.length < 10) w *= 0.1;
       if (row.name.startsWith("_")) w *= 0.1;
       addEdge(row.source_file_id, row.target_file_id, w, 1);
-      if (i % 500 === 499) await this.yieldToUi();
+      if (i % 500 === 499) if (this.onProgress) await this.yieldToUi();
       if (i % 2000 === 0) this.onProgress?.(-3, -3);
     }
 
     // Phase 2: Inferred edges (confidence=1) — unique exports only + BM25 IDF
     this.onProgress?.(-3, -3);
-    await this.yieldToUi();
+    if (this.onProgress) await this.yieldToUi();
 
     // Pre-compute export uniqueness to avoid correlated subquery in the main JOIN
     const uniqueExportNames = new Set<string>();
@@ -1776,7 +1783,7 @@ export class RepoMap {
       if (row.name.startsWith("_")) w *= 0.1;
 
       addEdge(row.source_file_id, row.target_file_id, w, 1);
-      if (i % 500 === 499) await this.yieldToUi();
+      if (i % 500 === 499) if (this.onProgress) await this.yieldToUi();
       if (i % 2000 === 0) this.onProgress?.(-3, -3);
     }
 
@@ -1800,7 +1807,7 @@ export class RepoMap {
       }
     }
 
-    await this.yieldToUi();
+    if (this.onProgress) await this.yieldToUi();
 
     // Barrel passthrough: resolve edges through barrel files to actual sources
     const barrelIds = new Set(
@@ -1883,7 +1890,7 @@ export class RepoMap {
         // database locked — edges will be rebuilt on next flush
       }
       if (i % 2000 === 0) this.onProgress?.(-3, -3);
-      if (i + BATCH < entries.length) await this.yieldToUi();
+      if (i + BATCH < entries.length) if (this.onProgress) await this.yieldToUi();
     }
   }
 
@@ -2180,7 +2187,7 @@ export class RepoMap {
       let delta = 0;
       for (let i = 0; i < n; i++) delta += Math.abs((next[i] ?? 0) - (rank[i] ?? 0));
       [rank, next] = [next, rank];
-      if (iter % 5 === 4) await this.yieldToUi();
+      if (iter % 5 === 4) if (this.onProgress) await this.yieldToUi();
       if (delta < 1e-6) break;
     }
 
@@ -2391,7 +2398,7 @@ export class RepoMap {
       }
       if (ci % 50 === 0) {
         this.onProgress?.(-5, -5);
-        await this.yieldToUi(); // yield so heartbeat can be delivered
+        if (this.onProgress) await this.yieldToUi(); // yield so heartbeat can be delivered
       }
     }
 
@@ -3125,7 +3132,7 @@ export class RepoMap {
           );
         }
       }
-      if (i % 20 === 19) await this.yieldToUi();
+      if (i % 20 === 19) if (this.onProgress) await this.yieldToUi();
     }
 
     const getImports = this.db.prepare<{ name: string; source_file_id: number }, [number]>(
@@ -3210,7 +3217,7 @@ export class RepoMap {
       });
       tx();
       if (batchStart % (BATCH_SIZE * 10) === 0) this.onProgress?.(-2, -2); // heartbeat
-      if (batchStart + BATCH_SIZE < filesWithImports.length) await this.yieldToUi();
+      if (batchStart + BATCH_SIZE < filesWithImports.length) if (this.onProgress) await this.yieldToUi();
     }
   }
 
@@ -3225,11 +3232,11 @@ export class RepoMap {
   private async flushAsync(): Promise<void> {
     try {
       await this.buildCallGraph();
-      await this.yieldToUi();
+      if (this.onProgress) await this.yieldToUi();
       await this.buildEdges();
       this.linkTestFiles();
       this.rescueOrphans();
-      await this.yieldToUi();
+      if (this.onProgress) await this.yieldToUi();
       await this.computePageRank();
     } catch {
       // DB closed during shutdown or locked — next flush will retry
@@ -4487,7 +4494,7 @@ export class RepoMap {
       );
       markReady.run(file.id);
 
-      if (i % 20 === 19) await this.yieldToUi();
+      if (i % 20 === 19) if (this.onProgress) await this.yieldToUi();
     }
   }
 
