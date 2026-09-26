@@ -72,3 +72,12 @@ export function emitFileRead(absPath: string): void {
 export function emitCacheReset(): void {
   for (const cb of cacheResetListeners) cb();
 }
+
+/** Test-only: live listener counts. */
+export function fileEventListenerCount(): { edit: number; cacheReset: number; read: number } {
+  return {
+    edit: editListeners.size,
+    cacheReset: cacheResetListeners.size,
+    read: readListeners.size,
+  };
+}

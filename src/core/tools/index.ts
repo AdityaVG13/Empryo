@@ -75,6 +75,9 @@ export { buildInteractiveTools } from "./interactive.js";
 
 let _soulToolWarningEmitted = false;
 
+/** Per-tab unsubs for buildTools file-event listeners. Rebuilds with the same tabId replace. */
+const toolFileEventUnsubs = new Map<string, () => void>();
+
 /**
  * Yield to the event loop before tool execution so the UI can render
  * the "running" spinner before synchronous operations block the thread.
@@ -412,15 +415,21 @@ export function buildTools(
   const fullReadCache = new Set<string>();
   const readCountPerFile = new Map<string, number>();
   const MAX_READS_PER_FILE = 3;
-  onFileEdited((absPath) => {
+  const listenerKey = opts?.tabId ?? "__none__";
+  toolFileEventUnsubs.get(listenerKey)?.();
+  const unsubEdit = onFileEdited((absPath) => {
     fullReadCache.delete(absPath);
     readCountPerFile.delete(absPath);
     resetDiffCache();
   });
-  onCacheReset(() => {
+  const unsubCacheReset = onCacheReset(() => {
     fullReadCache.clear();
     readCountPerFile.clear();
     resetDiffCache();
+  });
+  toolFileEventUnsubs.set(listenerKey, () => {
+    unsubEdit();
+    unsubCacheReset();
   });
   const resetReadCache = () => {
     fullReadCache.clear();
