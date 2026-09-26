@@ -942,11 +942,9 @@ export class RepoMap {
       })();
     }
 
-    let lineCount = 0;
     let content: string;
     try {
       content = readFileSync(absPath, "utf-8");
-      lineCount = content.split("\n").length;
     } catch {
       return;
     }
@@ -963,6 +961,22 @@ export class RepoMap {
       }
     }
     const symbolCount = outline?.symbols.length ?? 0;
+
+    // Signatures need the line array; reuse it for lineCount. Otherwise count \n only.
+    let lines: string[] | undefined;
+    let lineCount: number;
+    if (outline) {
+      lines = content.split("\n");
+      lineCount = lines.length;
+    } else {
+      lineCount = 1;
+      for (let i = 0; i < content.length; ) {
+        const nl = content.indexOf("\n", i);
+        if (nl === -1) break;
+        lineCount++;
+        i = nl + 1;
+      }
+    }
 
     let fileId: number;
     if (existing) {
@@ -982,13 +996,12 @@ export class RepoMap {
     }
     this.fileIdByPath.set(relPath, fileId);
 
-    if (outline) {
+    if (outline && lines) {
       const insertSym = this.db.prepare(
         "INSERT INTO symbols (file_id, name, kind, line, end_line, is_exported, signature, qualified_name, moniker) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       );
       const exportedNames = new Set(outline.exports.map((e) => e.name));
       const seen = new Set<string>();
-      const lines = content.split("\n");
 
       const MAX_SYMBOLS_PER_FILE = 10_000;
       const pending: Array<{
