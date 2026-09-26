@@ -2128,17 +2128,7 @@ export class RepoMap {
       if (delta < 1e-6) break;
     }
 
-    const update = this.db.prepare("UPDATE files SET pagerank = ? WHERE id = ?");
-    const tx = this.db.transaction(() => {
-      for (let i = 0; i < n; i++) {
-        update.run(rank[i] ?? 0, ids[i] ?? 0);
-      }
-    });
-    try {
-      tx();
-    } catch {
-      // database locked — stale pagerank values are acceptable
-    }
+    this.persistPageRanks(files, ids, rank);
   }
 
   /** Sync version for render-time personalized PageRank (small, bounded workload) */
@@ -2240,9 +2230,27 @@ export class RepoMap {
       if (delta < 1e-6) break;
     }
 
+    this.persistPageRanks(files, ids, rank);
+  }
+
+  /** Skip sqlite writeback when warm-start ranks already match (delta < 1e-9). */
+  private persistPageRanks(
+    files: Array<{ pagerank: number }>,
+    ids: number[],
+    rank: Float64Array,
+  ): void {
+    const n = files.length;
+    const changed: number[] = [];
+    for (let i = 0; i < n; i++) {
+      if (Math.abs((rank[i] ?? 0) - (files[i]?.pagerank ?? 0)) >= 1e-9) {
+        changed.push(i);
+      }
+    }
+    if (changed.length === 0) return;
+
     const update = this.db.prepare("UPDATE files SET pagerank = ? WHERE id = ?");
     const tx = this.db.transaction(() => {
-      for (let i = 0; i < n; i++) {
+      for (const i of changed) {
         update.run(rank[i] ?? 0, ids[i] ?? 0);
       }
     });
