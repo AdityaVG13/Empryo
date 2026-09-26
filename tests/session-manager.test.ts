@@ -388,4 +388,54 @@ describe("SessionManager.saveTab", () => {
 		);
 		expect(loaded!.tabCoreMessages?.get("tab-b")).toHaveLength(2);
 	});
+
+	it("second saveTab of the same tab appends and reloads from disk", async () => {
+		await manager.saveTab(
+			SID,
+			makeTab("tab-a"),
+			[makeMessage("user", "A1")],
+			undefined,
+			fallback("tab-a"),
+		);
+		await manager.saveTab(
+			SID,
+			makeTab("tab-a"),
+			[makeMessage("user", "A1"), makeMessage("assistant", "A2")],
+			undefined,
+			fallback("tab-a"),
+		);
+
+		const loaded = manager.loadSession(SID);
+		expect(loaded).not.toBeNull();
+		expect(loaded!.meta.tabs).toHaveLength(1);
+		expect(loaded!.tabMessages.get("tab-a")).toHaveLength(2);
+		expect(loaded!.tabMessages.get("tab-a")![0]!.content).toBe("A1");
+		expect(loaded!.tabMessages.get("tab-a")![1]!.content).toBe("A2");
+	});
+
+	it("saveTab of a second tab keeps the first tab's messages", async () => {
+		await manager.saveTab(
+			SID,
+			makeTab("tab-a"),
+			[makeMessage("user", "from-a")],
+			undefined,
+			fallback("tab-a"),
+		);
+		await manager.saveTab(
+			SID,
+			makeTab("tab-b"),
+			[makeMessage("user", "from-b"), makeMessage("assistant", "b-reply")],
+			undefined,
+			fallback("tab-b"),
+		);
+
+		const loaded = manager.loadSession(SID);
+		expect(loaded).not.toBeNull();
+		expect(loaded!.meta.tabs).toHaveLength(2);
+		expect(loaded!.tabMessages.get("tab-a")).toHaveLength(1);
+		expect(loaded!.tabMessages.get("tab-a")![0]!.content).toBe("from-a");
+		expect(loaded!.tabMessages.get("tab-b")).toHaveLength(2);
+		expect(loaded!.tabMessages.get("tab-b")![0]!.content).toBe("from-b");
+		expect(loaded!.tabMessages.get("tab-b")![1]!.content).toBe("b-reply");
+	});
 });

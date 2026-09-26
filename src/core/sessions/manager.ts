@@ -27,9 +27,17 @@ export interface SessionListEntry {
   sizeBytes: number;
 }
 
+type LastWrite = {
+  meta: SessionMeta;
+  messages: ChatMessage[];
+  core: Record<string, import("ai").ModelMessage[]>;
+};
+
 export class SessionManager {
   private dir: string;
   private cwd: string;
+  /** Last successful persist for saveTab — skip re-reading jsonl on the next splice. */
+  private lastWrites: Map<string, LastWrite> = new Map();
 
   constructor(cwd: string) {
     this.cwd = cwd;
@@ -83,6 +91,7 @@ export class SessionManager {
     tabMessages: Map<string, ChatMessage[]>,
     tabCoreMessages?: Map<string, import("ai").ModelMessage[]>,
   ): Promise<void> {
+    this.lastWrites.delete(meta.id);
     this.ensureDir();
     const sessionDir = join(this.dir, meta.id);
 
@@ -318,6 +327,7 @@ export class SessionManager {
     tabMessages: Map<string, ChatMessage[]>,
     tabCoreMessages?: Map<string, import("ai").ModelMessage[]>,
   ): void {
+    this.lastWrites.delete(meta.id);
     this.ensureDir();
     const sessionDir = join(this.dir, meta.id);
     if (!existsSync(sessionDir)) {
@@ -364,6 +374,7 @@ export class SessionManager {
   }
 
   deleteSession(id: string): boolean {
+    this.lastWrites.delete(id);
     const dir = join(this.dir, id);
     if (!existsSync(dir)) return false;
     // Clean up checkpoint git tags before deleting session files (sync to complete before rmSync)
@@ -402,6 +413,10 @@ export class SessionManager {
       const tmp = `${metaPath}.${suffix}.tmp`;
       writeFileSync(tmp, JSON.stringify(meta, null, 2), { encoding: "utf-8", mode: 0o600 });
       safeRename(tmp, metaPath);
+      const cached = this.lastWrites.get(id);
+      if (cached) {
+        cached.meta = { ...cached.meta, title: newTitle, customTitle: newTitle };
+      }
       return true;
     } catch {
       return false;
@@ -409,6 +424,7 @@ export class SessionManager {
   }
 
   clearAllSessions(): number {
+    this.lastWrites.clear();
     if (!existsSync(this.dir)) return 0;
     const entries = readdirSync(this.dir);
     let count = 0;
@@ -459,9 +475,10 @@ export class SessionManager {
    * tab's existing on-disk content. Used by per-tab autosave so concurrent
    * tabs never overwrite each other's history with a stale snapshot.
    *
-   * Reads existing meta.json + messages.jsonl + core.json, splices in the new
-   * slice (or appends a new tab entry if missing), recomputes messageRange
-   * offsets, atomically rewrites. Serialized per session id via saveChains.
+   * Splices the new slice into the last successful persist (or disk on miss),
+   * recomputes messageRange offsets, atomically rewrites. Serialized per
+   * session id via saveChains. After a successful write the in-memory last
+   * write is cached so the next saveTab skips readFileSync of jsonl.
    */
   async saveTab(
     sessionId: string,
@@ -513,40 +530,50 @@ export class SessionManager {
     const jsonlPath = join(sessionDir, "messages.jsonl");
     const corePath = join(sessionDir, "core.json");
 
-    // ── Load existing state (if any) so we splice this tab into the rest ──
+    // ── Load existing state so we splice this tab into the rest ──
+    // Cache hit: last successful persist for this session (skip jsonl parse).
+    // Miss: first saveTab / process start / a non-saveTab writer invalidated us.
     let existingMeta: SessionMeta | null = null;
-    if (existsSync(metaPath)) {
-      try {
-        existingMeta = JSON.parse(readFileSync(metaPath, "utf-8")) as SessionMeta;
-      } catch {
-        existingMeta = null;
-      }
-    }
+    let existingAllMessages: ChatMessage[] = [];
+    let existingCore: Record<string, import("ai").ModelMessage[]> = {};
 
-    const existingAllMessages: ChatMessage[] = [];
-    if (existsSync(jsonlPath)) {
-      const content = readFileSync(jsonlPath, "utf-8").trim();
-      if (content) {
-        for (const line of content.split("\n")) {
-          if (!line.trim()) continue;
-          try {
-            existingAllMessages.push(JSON.parse(line) as ChatMessage);
-          } catch {
-            break;
+    const cached = this.lastWrites.get(sessionId);
+    if (cached) {
+      existingMeta = cached.meta;
+      existingAllMessages = cached.messages;
+      existingCore = cached.core;
+    } else {
+      if (existsSync(metaPath)) {
+        try {
+          existingMeta = JSON.parse(readFileSync(metaPath, "utf-8")) as SessionMeta;
+        } catch {
+          existingMeta = null;
+        }
+      }
+
+      if (existsSync(jsonlPath)) {
+        const content = readFileSync(jsonlPath, "utf-8").trim();
+        if (content) {
+          for (const line of content.split("\n")) {
+            if (!line.trim()) continue;
+            try {
+              existingAllMessages.push(JSON.parse(line) as ChatMessage);
+            } catch {
+              break;
+            }
           }
         }
       }
-    }
 
-    let existingCore: Record<string, import("ai").ModelMessage[]> = {};
-    if (existsSync(corePath)) {
-      try {
-        existingCore = JSON.parse(readFileSync(corePath, "utf-8")) as Record<
-          string,
-          import("ai").ModelMessage[]
-        >;
-      } catch {
-        existingCore = {};
+      if (existsSync(corePath)) {
+        try {
+          existingCore = JSON.parse(readFileSync(corePath, "utf-8")) as Record<
+            string,
+            import("ai").ModelMessage[]
+          >;
+        } catch {
+          existingCore = {};
+        }
       }
     }
 
@@ -561,12 +588,12 @@ export class SessionManager {
     // using its prior messageRange). Target tab uses the new messages.
     //
     // TRUNCATION GUARD: if `messages` is shorter than the target tab's prior
-    // on-disk slice, prefer the on-disk version. A shorter incoming array is
-    // almost always a stale closure (older snapshot races a newer save) —
-    // accepting it would permanently drop user-visible history because the
-    // next save reads the truncated jsonl back as authoritative. UI must be a
-    // superset of what the model sees; we never shrink messages.jsonl unless
-    // the caller went through an explicit clear flow.
+    // slice (cached last write, else on-disk), keep the prior slice. A shorter
+    // incoming array is almost always a stale closure (older snapshot races a
+    // newer save) — accepting it would permanently drop user-visible history
+    // because the next save treats that truncated slice as authoritative. UI
+    // must be a superset of what the model sees; we never shrink messages.jsonl
+    // unless the caller went through an explicit clear flow.
     const allMessages: ChatMessage[] = [];
     const updatedTabs: TabMeta[] = updatedTabsRaw.map((t) => {
       let msgs: ChatMessage[];
@@ -577,7 +604,7 @@ export class SessionManager {
             ? existingAllMessages.slice(prevRange.startLine, prevRange.endLine)
             : [];
           if (messages.length < priorSlice.length) {
-            // Stale-closure save — keep durable on-disk history.
+            // Stale-closure save — keep durable prior history.
             msgs = priorSlice;
           } else {
             msgs = messages;
@@ -637,6 +664,12 @@ export class SessionManager {
       await writeFile(coreTmp, JSON.stringify(updatedCore), { encoding: "utf-8", mode: 0o600 });
       await rename(coreTmp, corePath);
     }
+
+    this.lastWrites.set(sessionId, {
+      meta: updatedMeta,
+      messages: allMessages,
+      core: updatedCore,
+    });
   }
 
   /**
@@ -723,6 +756,7 @@ export class SessionManager {
           });
           await rename(coreTmp, corePath);
         }
+        this.lastWrites.delete(sessionId);
       });
     this.saveChains.set(sessionId, next);
     try {
