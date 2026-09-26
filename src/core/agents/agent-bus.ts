@@ -442,7 +442,7 @@ export class AgentBus {
         meta = this.toolResultKeyMeta.get(k);
       }
 
-      if (!meta || !meta.parsed) {
+      if (!meta?.parsed) {
         if (k.includes(`"${filePath}"`) || k.includes(`:${filePath}:`)) {
           this.invalidateToolResult(k);
           count++;
