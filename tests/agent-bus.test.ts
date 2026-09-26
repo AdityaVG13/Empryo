@@ -623,6 +623,50 @@ describe("AgentBus — tool result cache", () => {
     const r = bus.acquireToolResult("a2", key);
     expect(r.hit).toBe(false);
   });
+
+  test("editing a file drops only matching grep/read/glob cache keys", () => {
+    const bus = new AgentBus();
+    const edited = "src/foo.ts";
+    const grepHit = JSON.stringify(["grep", "TODO", "src", ""]);
+    const grepMiss = JSON.stringify(["grep", "TODO", "lib", ""]);
+    const grepRoot = JSON.stringify(["grep", "TODO", ".", ""]);
+    const globHit = JSON.stringify(["glob", "*.ts", "src"]);
+    const globMiss = JSON.stringify(["glob", "*.ts", "lib"]);
+    const readEdited = JSON.stringify(["read", edited]);
+    const readOther = JSON.stringify(["read", "lib/bar.ts"]);
+    const web = JSON.stringify(["web_search", "foo"]);
+
+    const entries: Array<[string, string]> = [
+      [grepHit, "g-hit"],
+      [grepMiss, "g-miss"],
+      [grepRoot, "g-root"],
+      [globHit, "gl-hit"],
+      [globMiss, "gl-miss"],
+      [readEdited, "r-edit"],
+      [readOther, "r-other"],
+      [web, "web"],
+    ];
+    for (const [key, value] of entries) {
+      bus.cacheToolResult("a1", key, value);
+    }
+
+    bus.updateFile(edited, "export const foo = 1;\n");
+
+    expect(bus.acquireToolResult("a2", grepHit).hit).toBe(false);
+    expect(bus.acquireToolResult("a2", grepRoot).hit).toBe(false);
+    expect(bus.acquireToolResult("a2", globHit).hit).toBe(false);
+
+    const stillHit = (key: string, value: string) => {
+      const r = bus.acquireToolResult("a2", key);
+      expect(r.hit).toBe(true);
+      if (r.hit === true) expect(r.result).toBe(value);
+    };
+    stillHit(grepMiss, "g-miss");
+    stillHit(globMiss, "gl-miss");
+    stillHit(readEdited, "r-edit");
+    stillHit(readOther, "r-other");
+    stillHit(web, "web");
+  });
 });
 
 describe("AgentBus — peer objectives", () => {

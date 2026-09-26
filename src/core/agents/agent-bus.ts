@@ -136,6 +136,20 @@ const FINDING_MAX_CONTENT_BYTES = 2048;
 const FINDING_MAX_TOTAL_BYTES = 128 * 1024;
 const AGENT_WAIT_TIMEOUT_MS = 300_000;
 
+/** Parsed once at insert so invalidate can match without JSON.parse. */
+type ToolResultKeyMeta =
+  | { parsed: true; tool: string; parts: string[] }
+  | { parsed: false };
+
+function parseToolResultKey(key: string): ToolResultKeyMeta {
+  try {
+    const parts = JSON.parse(key) as string[];
+    return { parsed: true, tool: parts[0] ?? "", parts };
+  } catch {
+    return { parsed: false };
+  }
+}
+
 export class AgentBus {
   private findings: BusFinding[] = [];
   private findingKeys = new Map<string, number>();
@@ -152,6 +166,7 @@ export class AgentBus {
   private fileCacheBytes = 0;
   private readonly fileCacheMaxBytes = FILE_CACHE_MAX_BYTES;
   private toolResultCache = new Map<string, { result: string; ts: number; agentId: string }>();
+  private toolResultKeyMeta = new Map<string, ToolResultKeyMeta>();
   private toolResultWaiters = new Map<string, Array<(result: string | null) => void>>();
   private readonly toolResultCacheMaxSize = TOOL_RESULT_CACHE_MAX_SIZE;
   private readonly toolResultTTL = TOOL_RESULT_TTL_MS;
@@ -182,6 +197,7 @@ export class AgentBus {
       // Only tool results and findings are carried across dispatches.
       for (const [key, result] of shared.toolResults) {
         this.toolResultCache.set(key, result);
+        this.indexToolResultKey(key);
       }
       for (const finding of shared.findings) {
         this.postFinding(finding);
@@ -373,8 +389,18 @@ export class AgentBus {
     }
   }
 
-  private invalidateToolResult(key: string): void {
+  private indexToolResultKey(key: string): void {
+    if (this.toolResultKeyMeta.has(key)) return;
+    this.toolResultKeyMeta.set(key, parseToolResultKey(key));
+  }
+
+  private forgetToolResultCache(key: string): void {
     this.toolResultCache.delete(key);
+    this.toolResultKeyMeta.delete(key);
+  }
+
+  private invalidateToolResult(key: string): void {
+    this.forgetToolResultCache(key);
     const waiters = this.toolResultWaiters.get(key);
     if (waiters) {
       this.toolResultWaiters.delete(key);
@@ -406,25 +432,29 @@ export class AgentBus {
   private invalidateToolResultsForFile(filePath: string, editingAgentId: string): number {
     let count = 0;
     for (const [k, entry] of this.toolResultCache) {
-      try {
-        const parts = JSON.parse(k) as string[];
-        if (!this.keyMatchesFile(parts, filePath)) continue;
-        if (
-          parts[0] === "read" &&
-          entry.agentId === editingAgentId &&
-          parts[1] === filePath &&
-          parts[3]
-        ) {
-          continue;
-        }
-        this.invalidateToolResult(k);
-        count++;
-      } catch {
+      let meta = this.toolResultKeyMeta.get(k);
+      if (!meta) {
+        this.indexToolResultKey(k);
+        meta = this.toolResultKeyMeta.get(k);
+      }
+      if (!meta || !meta.parsed) {
         if (k.includes(`"${filePath}"`) || k.includes(`:${filePath}:`)) {
           this.invalidateToolResult(k);
           count++;
         }
+        continue;
       }
+      if (!this.keyMatchesFile(meta.parts, filePath)) continue;
+      if (
+        meta.parts[0] === "read" &&
+        entry.agentId === editingAgentId &&
+        meta.parts[1] === filePath &&
+        meta.parts[3]
+      ) {
+        continue;
+      }
+      this.invalidateToolResult(k);
+      count++;
     }
     return count;
   }
@@ -592,7 +622,7 @@ export class AgentBus {
     const entry = this.toolResultCache.get(key);
     if (entry !== undefined) {
       if (Date.now() - entry.ts > this.toolResultTTL) {
-        this.toolResultCache.delete(key);
+        this.forgetToolResultCache(key);
       } else {
         this._metrics.toolHits++;
         this.toolResultCache.delete(key);
@@ -627,9 +657,10 @@ export class AgentBus {
     if (this.toolResultCache.size >= this.toolResultCacheMaxSize) {
       this._metrics.toolEvictions++;
       const firstKey = this.toolResultCache.keys().next().value;
-      if (firstKey) this.toolResultCache.delete(firstKey);
+      if (firstKey) this.forgetToolResultCache(firstKey);
     }
     this.toolResultCache.set(key, { result, ts: Date.now(), agentId });
+    this.indexToolResultKey(key);
     try {
       this.onToolCacheEvent?.(agentId, this.toolNameFromKey(key), key, "store");
     } catch {}
