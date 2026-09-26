@@ -83,13 +83,15 @@ export class Beta {}
 
   it("keys cache by grammar string, not language object identity", async () => {
     const py = writeTemp("mod.py", "def foo():\n    pass\n");
-    const before = queryCacheSize();
     const outline1 = await backend.getFileOutline(py);
-    const after = queryCacheSize();
-    expect(after).toBeGreaterThan(before);
+    const afterFirst = queryCacheSize();
 
-    const outline2 = await backend.getFileOutline(py);
-    expect(queryCacheSize()).toBe(after);
+    // A second backend loads its own Language object for the same grammar —
+    // the compiled query must be shared, not recompiled.
+    const backend2 = new TreeSitterBackend();
+    await backend2.initialize(TMP);
+    const outline2 = await backend2.getFileOutline(py);
+    expect(queryCacheSize()).toBe(afterFirst);
     expect(outline2).toEqual(outline1);
     expect(outline1?.symbols.some((s) => s.name === "foo")).toBe(true);
   });
