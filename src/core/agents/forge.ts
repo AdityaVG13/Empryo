@@ -454,7 +454,7 @@ function buildForgePrepareStep(
     //   Step N+1: [...clean_17, INJECT_9, asst, tool, INJECT_10]
     //   Step N+2: [...clean_17, INJECT_9, asst, tool, INJECT_10, asst, tool, INJECT_11]
     if (tailParts.length > 0 || previousInjects.length > 0 || recallInjects.length > 0) {
-      const msgs = result.messages ?? [...sanitized];
+      const msgs = result.messages ?? (sanitized === messages ? [...sanitized] : sanitized);
       const cleanMsgCount = msgs.length;
 
       // Combine prior injects (tail user-msgs + recall pairs) sorted by their

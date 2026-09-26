@@ -68,7 +68,7 @@ export function sanitizeMessages(messages: ModelMessage[]): ModelMessage[] {
   // assistant messages. This prevents "unexpected tool_use_id found in
   // tool_result blocks" after compaction or session restore drops the
   // assistant that owned them.
-  const result = dirty ? cleaned : [...messages];
+  let result = dirty ? cleaned : messages;
   // Collect all valid (non-providerExecuted) tool-call IDs across the
   // conversation up front — Anthropic only cares that SOME prior assistant
   // owns the tool_use, not that it's the immediately preceding one.
@@ -97,9 +97,11 @@ export function sanitizeMessages(messages: ModelMessage[]): ModelMessage[] {
       return allValidCallIds.has(part.toolCallId);
     });
     if (filtered.length === 0) {
+      if (!dirty) result = [...result];
       result.splice(i, 1);
       dirty = true;
     } else if (filtered.length !== msg.content.length) {
+      if (!dirty) result = [...result];
       result[i] = { ...msg, content: filtered };
       dirty = true;
     }

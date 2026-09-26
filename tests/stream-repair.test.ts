@@ -234,6 +234,12 @@ describe("sanitizeMessages", () => {
     expect(result).toBe(messages);
   });
 
+  it("returns the same array reference for a clean user-only transcript", () => {
+    const messages = [{ role: "user" as const, content: "hello" }];
+    const result = sanitizeMessages(messages);
+    expect(result).toBe(messages);
+  });
+
   it("returns same reference for empty messages array", () => {
     const messages: Parameters<typeof sanitizeMessages>[0] = [];
     const result = sanitizeMessages(messages);
