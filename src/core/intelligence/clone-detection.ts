@@ -128,11 +128,28 @@ const HASH_B = new Uint32Array(NUM_HASHES);
   }
 }
 
-function hashTokensU32(tokens: string[]): Uint32Array {
+// tokenize() collapses identifiers/strings/numbers to $I/$S/$N and keeps KEYWORDS.
+// Precompute xxHash32 once so hashTokensU32 does not rehash those repeats.
+const TOKEN_XXHASH32 = new Map<string, number>();
+{
+  const intern = (t: string): void => {
+    TOKEN_XXHASH32.set(t, Bun.hash.xxHash32(t) >>> 0);
+  };
+  intern("$I");
+  intern("$S");
+  intern("$N");
+  for (const kw of KEYWORDS) intern(kw);
+}
+
+/** Test-visible interned xxHash32 of tokenize() volume tokens. */
+export function hashTokensU32(tokens: string[]): Uint32Array {
   const n = tokens.length;
   const out = new Uint32Array(n);
+  const intern = TOKEN_XXHASH32;
   for (let i = 0; i < n; i++) {
-    out[i] = Bun.hash.xxHash32(tokens[i] as string) >>> 0;
+    const t = tokens[i] as string;
+    const hit = intern.get(t);
+    out[i] = hit !== undefined ? hit : (Bun.hash.xxHash32(t) >>> 0);
   }
   return out;
 }
