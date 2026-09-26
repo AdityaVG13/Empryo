@@ -39,15 +39,17 @@ export function extractContentTrigrams(content: string): Set<number> {
   const out = new Set<number>();
   const len = content.length;
   if (len < MIN_TRIGRAM_LEN) return out;
-  for (let i = 0; i + 2 < len; i++) {
-    const a = lower(content.charCodeAt(i));
-    const b = lower(content.charCodeAt(i + 1));
-    const c = lower(content.charCodeAt(i + 2));
-    // Skip all-whitespace trigrams (space, tab, newline, CR).
-    if (isWs(a) && isWs(b) && isWs(c)) continue;
-    // Skip trigrams containing chars outside the byte range we pack (astral / >255).
-    if (a > 255 || b > 255 || c > 255) continue;
-    out.add(pack(a, b, c));
+  // Lower each byte once; the last two ride into the next window as a, b.
+  let a = lower(content.charCodeAt(0));
+  let b = lower(content.charCodeAt(1));
+  for (let i = 2; i < len; i++) {
+    const c = lower(content.charCodeAt(i));
+    // Skip all-whitespace (space, tab, newline, CR) and non-byte chars.
+    if ((a | b | c) <= 255 && !(isWs(a) && isWs(b) && isWs(c))) {
+      out.add(pack(a, b, c));
+    }
+    a = b;
+    b = c;
   }
   return out;
 }
