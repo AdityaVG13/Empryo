@@ -9,13 +9,15 @@ import { join } from "node:path";
 
 process.env.SOULFORGE_NO_REPOMAP = "1";
 
+import { MockLanguageModelV3 } from "ai/test";
+
 import { createForgeAgent } from "../src/core/agents/forge.js";
 import { ContextManager } from "../src/core/context/manager.js";
 import { MemoryManager } from "../src/core/memory/manager.js";
 import { buildTools } from "../src/core/tools/index.js";
 
 type MemoryTool = {
-  execute?: (args: Record<string, unknown>, ctx?: unknown) => Promise<unknown>;
+  execute?: (args: Record<string, string>) => Promise<{ success: boolean; output: string }>;
 };
 
 function isolateConfigDir(root: string): () => void {
@@ -24,9 +26,11 @@ function isolateConfigDir(root: string): () => void {
   const prevLocal = process.env.LOCALAPPDATA;
   process.env.HOME = home;
   process.env.LOCALAPPDATA = home;
+
   return () => {
     if (prevHome === undefined) delete process.env.HOME;
     else process.env.HOME = prevHome;
+
     if (prevLocal === undefined) delete process.env.LOCALAPPDATA;
     else process.env.LOCALAPPDATA = prevLocal;
   };
@@ -63,17 +67,14 @@ describe("buildTools memoryManager reuse", () => {
     const writeSpy = spyOn(mm, "write");
     const tools = buildTools(dir, undefined, undefined, { memoryManager: mm });
     const memory = (tools as { memory: MemoryTool }).memory;
-    expect(typeof memory.execute).toBe("function");
+    expect(memory.execute).toBeFunction();
 
-    const result = (await memory.execute!(
-      {
-        action: "write",
-        summary: "build-tools-reuse-marker",
-        details: "shared manager",
-        category: "pref",
-      },
-      {},
-    )) as { success: boolean; output: string };
+    const result = await memory.execute!({
+      action: "write",
+      summary: "build-tools-reuse-marker",
+      details: "shared manager",
+      category: "pref",
+    });
 
     expect(result.success).toBe(true);
     expect(writeSpy).toHaveBeenCalledTimes(1);
@@ -96,10 +97,9 @@ describe("buildTools memoryManager reuse", () => {
     const tools = buildTools(dir, undefined, undefined, { memoryManager: local });
     const memory = (tools as { memory: MemoryTool }).memory;
     local.close();
-    const result = (await memory.execute!({ action: "list" }, {})) as {
-      success: boolean;
-      output: string;
-    };
+
+    const result = await memory.execute!({ action: "list" });
+
     expect(result.success).toBe(false);
     expect(result.output.length).toBeGreaterThan(0);
   });
@@ -109,6 +109,7 @@ describe("buildTools without memoryManager", () => {
   it("opens project + global sqlite files (fallback constructor)", () => {
     const isolated = makeTmp("omit");
     const restoreHome = isolateConfigDir(isolated);
+
     try {
       buildTools(isolated);
       expect(existsSync(join(isolated, ".soulforge", "memory.db"))).toBe(true);
@@ -140,23 +141,23 @@ describe("createForgeAgent memoryManager wiring", () => {
   it("passes contextManager.getMemoryManager() into buildTools", async () => {
     const mm = cm.getMemoryManager();
     const writeSpy = spyOn(mm, "write");
-    // biome-ignore lint/suspicious/noExplicitAny: minimal model stub for agent construction
-    const model = { modelId: "anthropic/claude-sonnet-4-6", doGenerate: async () => ({}) } as any;
-    const agent = createForgeAgent({ model, contextManager: cm }) as unknown as {
-      tools: { memory?: MemoryTool };
-    };
-    const memory = agent.tools.memory;
-    expect(typeof memory?.execute).toBe("function");
+    const model = new MockLanguageModelV3({ modelId: "anthropic/claude-sonnet-4-6" });
 
-    const result = (await memory!.execute!(
-      {
-        action: "write",
-        summary: "forge-reuse-marker",
-        details: "wired from contextManager",
-        category: "pref",
-      },
-      {},
-    )) as { success: boolean; output: string };
+    // @ts-expect-error — test-only structural view of the agent's toolset
+    const agent: { tools: { memory?: MemoryTool } } = createForgeAgent({
+      model,
+      contextManager: cm,
+    });
+
+    const memory = agent.tools.memory;
+    expect(memory?.execute).toBeFunction();
+
+    const result = await memory!.execute!({
+      action: "write",
+      summary: "forge-reuse-marker",
+      details: "wired from contextManager",
+      category: "pref",
+    });
 
     expect(result.success).toBe(true);
     expect(writeSpy).toHaveBeenCalledTimes(1);

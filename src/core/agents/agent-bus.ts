@@ -137,13 +137,12 @@ const FINDING_MAX_TOTAL_BYTES = 128 * 1024;
 const AGENT_WAIT_TIMEOUT_MS = 300_000;
 
 /** Parsed once at insert so invalidate can match without JSON.parse. */
-type ToolResultKeyMeta =
-  | { parsed: true; tool: string; parts: string[] }
-  | { parsed: false };
+type ToolResultKeyMeta = { parsed: true; tool: string; parts: string[] } | { parsed: false };
 
 function parseToolResultKey(key: string): ToolResultKeyMeta {
   try {
     const parts = JSON.parse(key) as string[];
+
     return { parsed: true, tool: parts[0] ?? "", parts };
   } catch {
     return { parsed: false };
@@ -414,6 +413,10 @@ export class AgentBus {
     if (tool === "analyze") {
       return parts[1] === filePath;
     }
+
+    if (tool === "read") {
+      return parts[1] === filePath;
+    }
     if (tool === "navigate") {
       return parts[2] === filePath || parts[2] === "";
     }
@@ -433,18 +436,23 @@ export class AgentBus {
     let count = 0;
     for (const [k, entry] of this.toolResultCache) {
       let meta = this.toolResultKeyMeta.get(k);
+
       if (!meta) {
         this.indexToolResultKey(k);
         meta = this.toolResultKeyMeta.get(k);
       }
+
       if (!meta || !meta.parsed) {
         if (k.includes(`"${filePath}"`) || k.includes(`:${filePath}:`)) {
           this.invalidateToolResult(k);
           count++;
         }
+
         continue;
       }
+
       if (!this.keyMatchesFile(meta.parts, filePath)) continue;
+
       if (
         meta.parts[0] === "read" &&
         entry.agentId === editingAgentId &&
@@ -453,6 +461,7 @@ export class AgentBus {
       ) {
         continue;
       }
+
       this.invalidateToolResult(k);
       count++;
     }
@@ -657,6 +666,7 @@ export class AgentBus {
     if (this.toolResultCache.size >= this.toolResultCacheMaxSize) {
       this._metrics.toolEvictions++;
       const firstKey = this.toolResultCache.keys().next().value;
+
       if (firstKey) this.forgetToolResultCache(firstKey);
     }
     this.toolResultCache.set(key, { result, ts: Date.now(), agentId });

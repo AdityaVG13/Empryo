@@ -293,6 +293,34 @@ describe("SessionManager.saveTab", () => {
 		expect(loaded!.tabMessages.get("tab-c")![1]!.content).toBe("C-FINAL");
 	});
 
+	it("saveTab after another instance's rename preserves the new title", async () => {
+		await manager.saveTab(
+			SID,
+			makeTab("tab-a"),
+			[makeMessage("user", "A1")],
+			undefined,
+			fallback("tab-a"),
+		);
+
+		// A second manager for the same cwd renames the session (SessionPicker flow).
+		const other = new SessionManager(TEST_DIR);
+		expect(other.renameSession(SID, "Renamed elsewhere")).toBe(true);
+
+		// Our next saveTab must see the external write, not restore the old title.
+		await manager.saveTab(
+			SID,
+			makeTab("tab-a"),
+			[makeMessage("user", "A1"), makeMessage("assistant", "A2")],
+			undefined,
+			fallback("tab-a"),
+		);
+
+		const loaded = manager.loadSession(SID);
+		expect(loaded).not.toBeNull();
+		expect(loaded!.meta.title).toBe("Renamed elsewhere");
+		expect(loaded!.tabMessages.get("tab-a")).toHaveLength(2);
+	});
+
 	it("concurrent saves from different tabs all land — no tab lost", async () => {
 		await manager.saveSession(
 			makeMeta(SID, [{ id: "tab-a" }, { id: "tab-b" }, { id: "tab-c" }]),

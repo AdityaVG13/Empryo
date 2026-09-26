@@ -75,8 +75,72 @@ export { buildInteractiveTools } from "./interactive.js";
 
 let _soulToolWarningEmitted = false;
 
-/** Per-tab unsubs for buildTools file-event listeners. Rebuilds with the same tabId replace. */
-const toolFileEventUnsubs = new Map<string, () => void>();
+/**
+ * One shared file-event subscription per listener key, fanning out to every
+ * live tool set. Entries are strongly held but reference each set's caches
+ * weakly: a cache stays alive exactly while its owning tool set does (the
+ * set's execute closures retain it), and entries whose caches died are
+ * pruned lazily on dispatch — so dropped sets stop receiving invalidations
+ * without leaking entries or listeners.
+ */
+interface ToolFileEventTargets {
+  fullReadCache: WeakRef<Set<string>>;
+  readCountPerFile: WeakRef<Map<string, number>>;
+}
+
+interface ToolFileEventFanout {
+  targets: Set<ToolFileEventTargets>;
+}
+
+const toolFileEventFanouts = new Map<string, ToolFileEventFanout>();
+
+function getToolFileEventFanout(key: string): ToolFileEventFanout {
+  const existing = toolFileEventFanouts.get(key);
+
+  if (existing) return existing;
+  const fanout: ToolFileEventFanout = { targets: new Set() };
+  toolFileEventFanouts.set(key, fanout);
+  onFileEdited((absPath) => {
+    let live = false;
+
+    for (const t of fanout.targets) {
+      const cache = t.fullReadCache.deref();
+      const counts = t.readCountPerFile.deref();
+
+      if (!cache || !counts) {
+        fanout.targets.delete(t);
+        continue;
+      }
+
+      live = true;
+      cache.delete(absPath);
+      counts.delete(absPath);
+    }
+
+    if (live) resetDiffCache();
+  });
+  onCacheReset(() => {
+    let live = false;
+
+    for (const t of fanout.targets) {
+      const cache = t.fullReadCache.deref();
+      const counts = t.readCountPerFile.deref();
+
+      if (!cache || !counts) {
+        fanout.targets.delete(t);
+        continue;
+      }
+
+      live = true;
+      cache.clear();
+      counts.clear();
+    }
+
+    if (live) resetDiffCache();
+  });
+
+  return fanout;
+}
 
 /**
  * Yield to the event loop before tool execution so the UI can render
@@ -415,21 +479,20 @@ export function buildTools(
   const fullReadCache = new Set<string>();
   const readCountPerFile = new Map<string, number>();
   const MAX_READS_PER_FILE = 3;
+  // Tab-less sets (subagents, headless) stay live concurrently, so each keeps
+  // its own fanout targets — a shared "__none__" key must not let one set's
+  // rebuild steal another set's invalidation. Tabbed rebuilds replace: the
+  // old set is discarded, so its targets are dropped.
   const listenerKey = opts?.tabId ?? "__none__";
-  toolFileEventUnsubs.get(listenerKey)?.();
-  const unsubEdit = onFileEdited((absPath) => {
-    fullReadCache.delete(absPath);
-    readCountPerFile.delete(absPath);
-    resetDiffCache();
-  });
-  const unsubCacheReset = onCacheReset(() => {
-    fullReadCache.clear();
-    readCountPerFile.clear();
-    resetDiffCache();
-  });
-  toolFileEventUnsubs.set(listenerKey, () => {
-    unsubEdit();
-    unsubCacheReset();
+  const fanout = getToolFileEventFanout(listenerKey);
+
+  if (opts?.tabId) {
+    fanout.targets.clear();
+  }
+
+  fanout.targets.add({
+    fullReadCache: new WeakRef(fullReadCache),
+    readCountPerFile: new WeakRef(readCountPerFile),
   });
   const resetReadCache = () => {
     fullReadCache.clear();

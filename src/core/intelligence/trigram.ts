@@ -42,12 +42,14 @@ export function extractContentTrigrams(content: string): Set<number> {
   // Lower each byte once; the last two ride into the next window as a, b.
   let a = lower(content.charCodeAt(0));
   let b = lower(content.charCodeAt(1));
+
   for (let i = 2; i < len; i++) {
     const c = lower(content.charCodeAt(i));
     // Skip all-whitespace (space, tab, newline, CR) and non-byte chars.
     if ((a | b | c) <= 255 && !(isWs(a) && isWs(b) && isWs(c))) {
       out.add(pack(a, b, c));
     }
+
     a = b;
     b = c;
   }

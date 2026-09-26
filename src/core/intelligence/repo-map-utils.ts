@@ -401,19 +401,23 @@ async function collectFilesViaGit(dir: string): Promise<CollectedFile[] | null> 
     // Scan UI heartbeat is RepoMap.yieldToUi. Yield only on huge listings.
     const WAVE = candidates.length > 5000 ? 2000 : candidates.length;
     const files: CollectedFile[] = [];
+
     for (let i = 0; i < candidates.length; i += WAVE) {
       if (i > 0) await new Promise<void>((r) => queueMicrotask(r));
       const chunk = candidates.slice(i, i + WAVE);
+
       const batch = await Promise.all(
         chunk.map(async (fullPath) => {
           try {
             const s = await stat(fullPath);
-            if (s.size < MAX_FILE_SIZE)
-              return { path: fullPath, mtimeMs: s.mtimeMs, size: s.size };
+
+            if (s.size < MAX_FILE_SIZE) return { path: fullPath, mtimeMs: s.mtimeMs, size: s.size };
           } catch {}
+
           return null;
         }),
       );
+
       for (const f of batch) if (f) files.push(f);
     }
     return files;

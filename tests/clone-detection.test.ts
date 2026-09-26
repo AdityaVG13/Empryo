@@ -7,8 +7,10 @@ import {
 } from "../src/core/intelligence/clone-detection.js";
 
 function ids(prefix: string, n: number): string[] {
-  const out = new Array<string>(n);
-  for (let i = 0; i < n; i++) out[i] = `${prefix}${i}`;
+  const out: string[] = [];
+
+  for (let i = 0; i < n; i++) out.push(`${prefix}${i}`);
+
   return out;
 }
 
@@ -43,6 +45,7 @@ describe("tokenize", () => {
   a = 1 + 2 * (3 - 4) / 5 % 6;
   return x && y || !z;
 }`;
+
     const expected = Object.freeze([
       "function",
       "$I",
@@ -252,7 +255,8 @@ describe("tokenize", () => {
       ";",
       "}",
     ]);
-    expect(tokenize(fixture)).toEqual(expected as readonly string[]);
+
+    expect(tokenize(fixture)).toEqual(expected);
   });
 });
 
@@ -260,6 +264,7 @@ describe("hashTokensU32", () => {
   test("interned tokens match Bun.hash.xxHash32 of the same string", () => {
     const interned = ["$I", "$S", "$N", "if", "return", "function", "None"];
     const hashed = hashTokensU32(interned);
+
     for (let i = 0; i < interned.length; i++) {
       expect(hashed[i]).toBe(Bun.hash.xxHash32(interned[i] as string) >>> 0);
     }

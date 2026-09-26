@@ -510,9 +510,11 @@ function createQuery(lang: TSLanguage, source: string, grammarKey: string): TSQu
   if (!TSQueryClass) throw new Error("tree-sitter not initialized");
   const key = `${grammarKey}\0${source}`;
   const cached = queryCache.get(key);
+
   if (cached) return cached;
   const query = new TSQueryClass(lang, source);
   queryCache.set(key, query);
+
   return query;
 }
 
@@ -525,6 +527,7 @@ function disposeQueryCache(): void {
   for (const query of queryCache.values()) {
     query.delete();
   }
+
   queryCache.clear();
 }
 
@@ -698,24 +701,33 @@ export class TreeSitterBackend implements IntelligenceBackend {
       // Also capture re-exports: export { X } from './y'
       if (language === "typescript" || language === "javascript") {
         const reExportQuery = createQuery(tsLang, `(export_statement) @export`, grammarKey);
+
         for (const match of reExportQuery.matches(tree.rootNode)) {
           const cap = match.captures.find((c: TSQueryCapture) => c.name === "export");
+
           if (!cap) continue;
           const node = cap.node;
           const source = node.childForFieldName("source");
+
           if (!source) continue;
+
           const clause = node.namedChildren.find(
             (c: TSNode | null) => c != null && c.type === "export_clause",
           );
+
           if (!clause) continue;
           const specifiers: string[] = [];
+
           for (let ci = 0; ci < clause.namedChildCount; ci++) {
             const spec = clause.namedChild(ci);
+
             if (spec?.type === "export_specifier") {
               const name = spec.childForFieldName("name");
+
               if (name) specifiers.push(name.text);
             }
           }
+
           if (specifiers.length > 0) {
             imports.push({
               source: source.text.replace(/['"]/g, ""),
@@ -851,7 +863,9 @@ export class TreeSitterBackend implements IntelligenceBackend {
   /** Load each distinct grammar once. Call before a sync bulk outline loop. */
   async ensureGrammars(files: string[]): Promise<void> {
     const keys = new Set<string>();
+
     for (const file of files) keys.add(this.grammarKeyForFile(file));
+
     for (const key of keys) {
       if (this.languages.has(key) || this.failedLanguages.has(key)) continue;
       await this.loadLanguage(key);
@@ -869,7 +883,9 @@ export class TreeSitterBackend implements IntelligenceBackend {
   ): (FileOutline & { shapeHashes?: ShapeHash[] }) | null {
     if (!source || source.length > TreeSitterBackend.MAX_FILE_BYTES) return null;
     const tree = this.parseFileSync(file, source);
+
     if (!tree) return null;
+
     return this.outlineFromTree(file, source, tree, opts);
   }
 
@@ -878,11 +894,14 @@ export class TreeSitterBackend implements IntelligenceBackend {
     opts?: { shapeHashes?: boolean; content?: string },
   ): Promise<(FileOutline & { shapeHashes?: ShapeHash[] }) | null> {
     const source = opts?.content ?? (await this.readFileContent(file));
+
     if (!source || source.length > TreeSitterBackend.MAX_FILE_BYTES) return null;
 
     await this.loadLanguage(this.grammarKeyForFile(file));
     const tree = this.parseFileSync(file, source);
+
     if (!tree) return null;
+
     return this.outlineFromTree(file, source, tree, opts);
   }
 
@@ -912,10 +931,12 @@ export class TreeSitterBackend implements IntelligenceBackend {
       if (mainQueryStr) {
         const mainQuery = createQuery(tsLang, mainQueryStr, grammarKey);
         const matches = mainQuery.matches(tree.rootNode);
+
         for (const match of matches) {
           let nameCapture: TSQueryCapture | undefined;
           let sourceCapture: TSQueryCapture | undefined;
           let patternCapture: TSQueryCapture | undefined;
+
           for (const c of match.captures) {
             if (c.name === "name") nameCapture = c;
             else if (c.name === "source") sourceCapture = c;
@@ -927,11 +948,13 @@ export class TreeSitterBackend implements IntelligenceBackend {
             const node = patternCapture.node;
             const source = sourceCapture ? sourceCapture.node.text.replace(/['"]/g, "") : node.text;
             const specifiers = extractImportSpecifiers(node, language);
+
             const isDefault =
               specifiers.length > 0 &&
               node.text.includes("import ") &&
               !node.text.includes("{") &&
               !node.text.includes("*");
+
             const isNamespace = node.text.includes("* as ");
             imports.push({
               source,
@@ -952,6 +975,7 @@ export class TreeSitterBackend implements IntelligenceBackend {
           if (patternCapture?.name === "export") {
             const node = patternCapture.node;
             const isDefault = node.text.includes("export default");
+
             const decl = node.namedChildren.find(
               (c: TSNode | null) =>
                 c != null &&
@@ -961,14 +985,17 @@ export class TreeSitterBackend implements IntelligenceBackend {
                   c.type === "type_alias_declaration" ||
                   c.type === "lexical_declaration"),
             );
+
             if (decl) {
               const expNameNode =
                 decl.childForFieldName("name") ??
                 decl.namedChildren
                   .find((c: TSNode | null) => c != null && c.type === "variable_declarator")
                   ?.childForFieldName("name");
+
               if (expNameNode) {
                 let kind: SymbolKind = "variable";
+
                 if (decl.type.includes("function")) kind = "function";
                 else if (decl.type.includes("class")) kind = "class";
                 else if (decl.type.includes("interface")) kind = "interface";
@@ -990,20 +1017,26 @@ export class TreeSitterBackend implements IntelligenceBackend {
               const clause = node.namedChildren.find(
                 (c: TSNode | null) => c != null && c.type === "export_clause",
               );
+
               if (clause) {
                 const reExportSource = node.childForFieldName("source");
+
                 const source = reExportSource
                   ? reExportSource.text.replace(/['"]/g, "")
                   : undefined;
+
                 const specNames: string[] = [];
                 const origNames: string[] = [];
+
                 for (let ci = 0; ci < clause.namedChildCount; ci++) {
                   const spec = clause.namedChild(ci);
+
                   if (spec?.type === "export_specifier") {
                     const alias = spec.childForFieldName("alias");
                     const name = spec.childForFieldName("name");
                     // Export name is the alias (public-facing) or the original name
                     const exportName = alias ?? name;
+
                     if (exportName) {
                       specNames.push(exportName.text);
                       exports.push({
@@ -1044,7 +1077,9 @@ export class TreeSitterBackend implements IntelligenceBackend {
                   node.namedChildren.some(
                     (c: TSNode | null) => c != null && c.type === "namespace_export",
                   ) || node.text.includes("export *");
+
                 const reExportSource = node.childForFieldName("source");
+
                 if (hasStar && reExportSource) {
                   const source = reExportSource.text.replace(/['"]/g, "");
                   imports.push({
@@ -1062,6 +1097,7 @@ export class TreeSitterBackend implements IntelligenceBackend {
                 }
               }
             }
+
             continue;
           }
 
@@ -1092,10 +1128,13 @@ export class TreeSitterBackend implements IntelligenceBackend {
           `(call_expression function: (import) arguments: (arguments (string) @source)) @dynamic_import`,
           grammarKey,
         );
+
         for (const match of dynamicImportQuery.matches(tree.rootNode)) {
           const sourceCapture = match.captures.find((c: TSQueryCapture) => c.name === "source");
+
           if (!sourceCapture) continue;
           const source = sourceCapture.node.text.replace(/['"`]/g, "");
+
           if (!source) continue;
 
           // Extract destructured names from the variable declaration context
@@ -1103,7 +1142,9 @@ export class TreeSitterBackend implements IntelligenceBackend {
           const importNode = match.captures.find(
             (c: TSQueryCapture) => c.name === "dynamic_import",
           );
+
           const specifiers: string[] = [];
+
           if (importNode) {
             // Walk up to find destructuring pattern
             let current: TSNode | null = importNode.node.parent;
@@ -1115,16 +1156,20 @@ export class TreeSitterBackend implements IntelligenceBackend {
             ) {
               current = current.parent;
             }
+
             if (current) {
               const pattern =
                 current.childForFieldName("name") ?? current.childForFieldName("left");
+
               if (pattern?.type === "object_pattern") {
                 for (let ci = 0; ci < pattern.namedChildCount; ci++) {
                   const child = pattern.namedChild(ci);
+
                   if (child?.type === "shorthand_property_identifier_pattern") {
                     specifiers.push(child.text);
                   } else if (child?.type === "pair_pattern") {
                     const key = child.childForFieldName("key");
+
                     if (key) specifiers.push(key.text);
                   }
                 }
@@ -1164,12 +1209,14 @@ export class TreeSitterBackend implements IntelligenceBackend {
     // CommonJS: extract exports from module.exports = { ... } for JS files
     if ((language === "javascript" || language === "typescript") && exports.length === 0) {
       const cjsMatch = source.match(/module\.exports\s*=\s*\{([^}]+)\}/);
+
       if (cjsMatch?.[1]) {
         for (const item of cjsMatch[1].split(",")) {
           const name = item
             .trim()
             .split(/\s*[:=]/)[0]
             ?.trim();
+
           if (name && /^\w+$/.test(name)) {
             const sym = symbols.find((s) => s.name === name);
             exports.push({
@@ -1190,8 +1237,10 @@ export class TreeSitterBackend implements IntelligenceBackend {
     // Infer exports from visibility conventions for non-TS/JS languages
     if (exports.length === 0 && language !== "typescript" && language !== "javascript") {
       const lines = source.split("\n");
+
       for (const sym of symbols) {
         const line = lines[sym.location.line - 1] ?? "";
+
         if (isPublicSymbol(sym.name, line, language, file)) {
           exports.push({
             name: sym.name,
@@ -1203,14 +1252,19 @@ export class TreeSitterBackend implements IntelligenceBackend {
       }
     }
 
-    return {
+    const outline: FileOutline & { shapeHashes?: ShapeHash[] } = {
       file: absFile,
       language,
       symbols,
       imports,
       exports,
-      ...(opts?.shapeHashes ? { shapeHashes: hashes ?? [] } : {}),
     };
+
+    if (opts?.shapeHashes) {
+      outline.shapeHashes = hashes ?? [];
+    }
+
+    return outline;
   }
 
   async readSymbol(
@@ -1403,9 +1457,11 @@ export class TreeSitterBackend implements IntelligenceBackend {
   private shapeHashesFromTree(tree: TSTree): ShapeHash[] {
     const nodes: Array<{ node: TSNode; name: string; kind: string }> = [];
     this.collectHashableNodes(tree.rootNode, nodes, 0);
+
     if (nodes.length === 0) return [];
 
     const results: ShapeHash[] = [];
+
     for (const { node, name, kind } of nodes) {
       const serialized = this.serializeShape(node, 0);
       const hash = Bun.hash(serialized).toString(16);
@@ -1419,6 +1475,7 @@ export class TreeSitterBackend implements IntelligenceBackend {
         nodeCount,
       });
     }
+
     return results;
   }
 
@@ -1506,14 +1563,17 @@ export class TreeSitterBackend implements IntelligenceBackend {
 
   private parseFileSync(file: string, source: string): TSTree | null {
     if (!this.parser) return null;
+
     if (!source || source.length > TreeSitterBackend.MAX_FILE_BYTES) return null;
 
     const grammarKey = this.grammarKeyForFile(file);
     const lang = this.languages.get(grammarKey);
+
     if (!lang) return null;
 
     this.parser.setLanguage(lang);
     const deadline = performance.now() + TreeSitterBackend.PARSE_BUDGET_MS;
+
     try {
       return this.parser.parse(source, null, {
         progressCallback: () => performance.now() > deadline,
@@ -1521,6 +1581,7 @@ export class TreeSitterBackend implements IntelligenceBackend {
     } catch {
       this.failedLanguages.add(grammarKey);
       this.languages.delete(grammarKey);
+
       return null;
     }
   }
@@ -1530,10 +1591,12 @@ export class TreeSitterBackend implements IntelligenceBackend {
 
     const absPath = resolve(file);
     const source = content ?? (await this.readFileContent(absPath));
+
     if (!source || source.length > TreeSitterBackend.MAX_FILE_BYTES) return null;
 
     // Inline content (scan): parse once, no LRU copy. Disk reads (live router) still cache.
     const cached = content === undefined ? this.treeCache.get(absPath) : undefined;
+
     if (cached && cached.content === source) {
       // Return a copy since callers delete the tree
       return cached.tree.copy();
@@ -1557,6 +1620,7 @@ export class TreeSitterBackend implements IntelligenceBackend {
         this.treeCache.delete(firstKey);
       }
     }
+
     this.treeCache.set(absPath, { tree: tree.copy(), content: source });
 
     return tree;

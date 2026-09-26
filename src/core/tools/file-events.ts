@@ -74,7 +74,13 @@ export function emitCacheReset(): void {
 }
 
 /** Test-only: live listener counts. */
-export function fileEventListenerCount(): { edit: number; cacheReset: number; read: number } {
+export interface FileEventListenerCounts {
+  edit: number;
+  cacheReset: number;
+  read: number;
+}
+
+export function fileEventListenerCount(): FileEventListenerCounts {
   return {
     edit: editListeners.size,
     cacheReset: cacheResetListeners.size,

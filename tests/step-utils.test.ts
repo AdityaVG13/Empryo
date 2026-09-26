@@ -1901,11 +1901,13 @@ describe("detectRepeatedCalls stringify cache", () => {
 
 	it("identical input object twice yields the same signature", () => {
 		const input = { path: "a.ts", extra: "same-ref" };
+
 		const steps = [
 			makeStep([{ toolName: "read", input }]),
 			makeStep([{ toolName: "read", input }]),
 			makeStep([{ toolName: "read", input }]),
 		];
+
 		const first = detectRepeatedCalls(steps);
 		const second = detectRepeatedCalls(steps);
 		expect(first).not.toBeNull();
@@ -1918,16 +1920,19 @@ describe("detectRepeatedCalls stringify cache", () => {
 		const original = { path: "a.ts" };
 		const mutated = { path: "a.ts" };
 		mutated.path = "b.ts";
+
 		const stepsA = [
 			makeStep([{ toolName: "read", input: original }]),
 			makeStep([{ toolName: "read", input: original }]),
 			makeStep([{ toolName: "read", input: original }]),
 		];
+
 		const stepsB = [
 			makeStep([{ toolName: "read", input: mutated }]),
 			makeStep([{ toolName: "read", input: mutated }]),
 			makeStep([{ toolName: "read", input: mutated }]),
 		];
+
 		const a = detectRepeatedCalls(stepsA);
 		const b = detectRepeatedCalls(stepsB);
 		expect(a).not.toBeNull();
@@ -1937,16 +1942,38 @@ describe("detectRepeatedCalls stringify cache", () => {
 		expect(b!.signature).toBe(`read::${JSON.stringify({ path: "b.ts" })}`);
 	});
 
+	it("mutating the same object between calls yields a fresh signature", () => {
+		const input = { path: "a.ts" };
+
+		const steps = [
+			makeStep([{ toolName: "read", input }]),
+			makeStep([{ toolName: "read", input }]),
+			makeStep([{ toolName: "read", input }]),
+		];
+
+		const before = detectRepeatedCalls(steps);
+		expect(before).not.toBeNull();
+		expect(before!.signature).toBe(`read::${JSON.stringify({ path: "a.ts" })}`);
+		input.path = "b.ts";
+		const after = detectRepeatedCalls(steps);
+		expect(after).not.toBeNull();
+		expect(after!.signature).toBe(`read::${JSON.stringify({ path: "b.ts" })}`);
+	});
+
 	it("1000 calls with a 2KB input object stay consistent", () => {
 		const input = { blob: "x".repeat(2048) };
+
 		const steps = Array.from({ length: 8 }, () =>
 			makeStep([{ toolName: "read", input }]),
 		);
+
 		const t0 = performance.now();
 		let last: ReturnType<typeof detectRepeatedCalls> = null;
+
 		for (let i = 0; i < 1000; i++) {
 			last = detectRepeatedCalls(steps);
 		}
+
 		const ms = performance.now() - t0;
 		expect(last).not.toBeNull();
 		expect(last!.count).toBe(8);

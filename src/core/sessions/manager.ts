@@ -31,6 +31,9 @@ type LastWrite = {
   meta: SessionMeta;
   messages: ChatMessage[];
   core: Record<string, import("ai").ModelMessage[]>;
+  /** meta.json stat at persist time — any external rewrite invalidates. */
+  metaMtimeMs: number;
+  metaSize: number;
 };
 
 export class SessionManager {
@@ -414,8 +417,17 @@ export class SessionManager {
       writeFileSync(tmp, JSON.stringify(meta, null, 2), { encoding: "utf-8", mode: 0o600 });
       safeRename(tmp, metaPath);
       const cached = this.lastWrites.get(id);
+
       if (cached) {
         cached.meta = { ...cached.meta, title: newTitle, customTitle: newTitle };
+
+        try {
+          const stat = statSync(metaPath);
+          cached.metaMtimeMs = stat.mtimeMs;
+          cached.metaSize = stat.size;
+        } catch {
+          this.lastWrites.delete(id);
+        }
       }
       return true;
     } catch {
@@ -538,7 +550,21 @@ export class SessionManager {
     let existingCore: Record<string, import("ai").ModelMessage[]> = {};
 
     const cached = this.lastWrites.get(sessionId);
+    // Another SessionManager for the same cwd (e.g. SessionPicker) may have
+    // renamed, deleted, or rewritten the session since our last persist.
+    // meta.json is rewritten on every persist, so its stat detects that.
+    let fresh = false;
+
     if (cached) {
+      try {
+        const stat = statSync(metaPath);
+        fresh = stat.mtimeMs === cached.metaMtimeMs && stat.size === cached.metaSize;
+      } catch {
+        fresh = false;
+      }
+    }
+
+    if (cached && fresh) {
       existingMeta = cached.meta;
       existingAllMessages = cached.messages;
       existingCore = cached.core;
@@ -553,9 +579,11 @@ export class SessionManager {
 
       if (existsSync(jsonlPath)) {
         const content = readFileSync(jsonlPath, "utf-8").trim();
+
         if (content) {
           for (const line of content.split("\n")) {
             if (!line.trim()) continue;
+
             try {
               existingAllMessages.push(JSON.parse(line) as ChatMessage);
             } catch {
@@ -665,10 +693,26 @@ export class SessionManager {
       await rename(coreTmp, corePath);
     }
 
+    // Capture the post-rename stat so the next saveTab can detect writes
+    // from another SessionManager. On failure keep a sentinel that forces
+    // a disk reload.
+    let metaMtimeMs = -1;
+    let metaSize = -1;
+
+    try {
+      const stat = statSync(metaPath);
+      metaMtimeMs = stat.mtimeMs;
+      metaSize = stat.size;
+    } catch {
+      // Leave the sentinel — the next saveTab reloads from disk.
+    }
+
     this.lastWrites.set(sessionId, {
       meta: updatedMeta,
       messages: allMessages,
       core: updatedCore,
+      metaMtimeMs,
+      metaSize,
     });
   }
 
@@ -756,6 +800,7 @@ export class SessionManager {
           });
           await rename(coreTmp, corePath);
         }
+
         this.lastWrites.delete(sessionId);
       });
     this.saveChains.set(sessionId, next);

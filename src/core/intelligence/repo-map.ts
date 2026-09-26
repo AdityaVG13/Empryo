@@ -4,6 +4,7 @@ import { stat as statAsync } from "node:fs/promises";
 import { dirname, extname, join, relative, resolve } from "node:path";
 import { ensureSoulforgeDir } from "../utils/ensure-soulforge-dir.js";
 import {
+  CLONE_HASH_SCHEME_VERSION,
   computeFragmentHashes,
   computeMinHash,
   jaccardSimilarity,
@@ -69,6 +70,7 @@ const SNAKE_IDENT_LANGUAGES: ReadonlySet<Language> = new Set([
 /** Clone shape/token hashing is deferred until clone search. Giant files
  *  stay excluded then (serializeShape hotspot on 5k-line ASTs). */
 const CLONE_MAX_LINES = 3000;
+
 const CLONE_MAX_SYMBOLS = 1500;
 
 /** Kinds that can own nested symbols for qualified_name (tightest enclosing span). */
@@ -525,6 +527,19 @@ export class RepoMap {
       `);
     } catch {}
 
+    // Clone-hash scheme version: token_signatures/token_fragments rows from
+    // an older scheme are silently incomparable with fresh rows, so a version
+    // mismatch — or no version on legacy DBs — invalidates them for deferred
+    // regeneration instead of marking files ready merely because rows exist.
+    try {
+      if (this.metaGet("clone_hash_version") !== String(CLONE_HASH_SCHEME_VERSION)) {
+        this.db.run("DELETE FROM token_signatures");
+        this.db.run("DELETE FROM token_fragments");
+        this.db.run("UPDATE files SET clone_ready = 0");
+        this.metaSet("clone_hash_version", String(CLONE_HASH_SCHEME_VERSION));
+      }
+    } catch {}
+
     this.rebuildFts();
   }
 
@@ -665,6 +680,7 @@ export class RepoMap {
   /** Yield to the TUI heartbeat only when a progress listener is attached. */
   private yieldToUi(): Promise<void> {
     if (!this.onProgress) return Promise.resolve();
+
     return new Promise((r) => setTimeout(r, 1));
   }
 
@@ -672,13 +688,16 @@ export class RepoMap {
   private runInTx(fn: () => void): void {
     if (this.bulkIngest) {
       fn();
+
       return;
     }
+
     this.db.transaction(fn)();
   }
 
   private llmSummariesPresent(): boolean {
     if (this.hasLlmSummaries !== null) return this.hasLlmSummaries;
+
     try {
       this.hasLlmSummaries =
         this.db
@@ -689,6 +708,7 @@ export class RepoMap {
     } catch {
       this.hasLlmSummaries = false;
     }
+
     return this.hasLlmSummaries;
   }
 
@@ -791,33 +811,42 @@ export class RepoMap {
       if (toIndex.length > 0) {
         this.onProgress?.(0, toIndex.length);
         await this.ensureTreeSitter();
-        this.dropSecondaryIndexes();
-        // FTS5 triggers fire per INSERT/DELETE — defer and bulk-rebuild after COMMIT.
-        this.db.run("DROP TRIGGER IF EXISTS symbols_ai");
-        this.db.run("DROP TRIGGER IF EXISTS symbols_ad");
+        // Dropping + rebuilding all secondary indexes and the FTS table only
+        // pays off for cold scans or large batches. Small incremental scans
+        // keep indexes live so per-file DELETEs stay indexed and the FTS
+        // triggers handle one file's rows; the outer BEGIN IMMEDIATE still
+        // batches the writes.
+        const bulk =
+          existingFiles.size === 0 || toIndex.length > Math.max(500, existingFiles.size * 0.25);
+
+        if (bulk) {
+          this.dropSecondaryIndexes();
+          // FTS5 triggers fire per INSERT/DELETE — defer and bulk-rebuild after COMMIT.
+          this.db.run("DROP TRIGGER IF EXISTS symbols_ai");
+          this.db.run("DROP TRIGGER IF EXISTS symbols_ad");
+        }
         // FK checks on every child INSERT; we already delete children explicitly.
         this.db.run("PRAGMA foreign_keys = OFF");
         this.db.run("PRAGMA synchronous = OFF");
         this.bulkIngest = true;
         this.hasLlmSummaries = null;
+
         if (this.treeSitter) {
           await this.treeSitter.ensureGrammars(toIndex.map((f) => f.absPath));
         }
+
         try {
           this.db.run("BEGIN IMMEDIATE");
+
           for (let i = 0; i < toIndex.length; i++) {
             const file = toIndex[i];
+
             if (file) {
               try {
-                this.indexFile(
-                  file.absPath,
-                  file.relPath,
-                  file.mtime,
-                  file.language,
-                  file.size,
-                );
+                this.indexFile(file.absPath, file.relPath, file.mtime, file.language, file.size);
               } catch (err) {
                 this.indexErrors++;
+
                 if (this.indexErrors <= 5) {
                   this.onError?.(
                     `Failed to index ${file.relPath}: ${err instanceof Error ? err.message : String(err)}`,
@@ -825,24 +854,35 @@ export class RepoMap {
                 }
               }
             }
+
             if (this.onProgress && i % 5 === 0) {
               this.onProgress(i + 1, toIndex.length);
-              if (this.onProgress) await this.yieldToUi();
+              await this.yieldToUi();
             }
           }
+
           this.db.run("COMMIT");
         } catch (err) {
           try {
             this.db.run("ROLLBACK");
           } catch {}
+          // ROLLBACK discards rows the loop staged in memory — drop the
+          // caches (re-hydrated at the next scan start) before rethrowing.
+          this.fileIdByPath.clear();
+          this.trigramPostingCounts = null;
           throw err;
         } finally {
           this.bulkIngest = false;
-          this.createSecondaryIndexes();
-          this.rebuildFts();
+
+          if (bulk) {
+            this.createSecondaryIndexes();
+            this.rebuildFts();
+          }
+
           try {
             this.db.run("PRAGMA foreign_keys = ON");
           } catch {}
+
           try {
             this.db.run("PRAGMA synchronous = NORMAL");
           } catch {}
@@ -860,28 +900,35 @@ export class RepoMap {
 
       if (needsPostIndexing) {
         this.onProgress?.(-1, -1); // resolving refs
+
         if (this.onProgress) await this.yieldToUi();
         await this.resolveUnresolvedRefs();
         this.onProgress?.(-1, -1);
+
         if (this.onProgress) await this.yieldToUi();
         await this.resolveIdentifierRefs();
         this.onProgress?.(-2, -2); // call graph
+
         if (this.onProgress) await this.yieldToUi();
         await this.buildCallGraph();
         this.scanContents = null;
         this.onProgress?.(-3, -3); // edges
+
         if (this.onProgress) await this.yieldToUi();
         await this.buildEdges();
         this.onProgress?.(-4, -4); // test linking + orphans
         this.linkTestFiles();
         this.rescueOrphans();
         this.onProgress?.(-4, -4);
+
         if (this.onProgress) await this.yieldToUi();
         await this.computePageRank();
+
         if (this.onProgress) await this.yieldToUi();
       }
 
       this.onProgress?.(-5, -5); // cochanges
+
       if (this.onProgress) await this.yieldToUi();
       await this.buildCoChanges();
 
@@ -965,7 +1012,7 @@ export class RepoMap {
     mtime: number,
     language: Language,
     size = 0,
-  ): Promise<void> {
+  ): void {
     const existing = this.db
       .query<{ id: number }, [string]>("SELECT id FROM files WHERE path = ?")
       .get(relPath);
@@ -997,6 +1044,7 @@ export class RepoMap {
     } catch {
       return;
     }
+
     this.scanContents?.set(relPath, content);
 
     let outline: import("./types.js").FileOutline | null = null;
@@ -1014,13 +1062,16 @@ export class RepoMap {
     // Signatures need the line array; reuse it for lineCount. Otherwise count \n only.
     let lines: string[] | undefined;
     let lineCount: number;
+
     if (outline) {
       lines = content.split("\n");
       lineCount = lines.length;
     } else {
       lineCount = 1;
+
       for (let i = 0; i < content.length; ) {
         const nl = content.indexOf("\n", i);
+
         if (nl === -1) break;
         lineCount++;
         i = nl + 1;
@@ -1041,8 +1092,10 @@ export class RepoMap {
           "INSERT INTO files (path, mtime_ms, language, line_count, symbol_count, size_bytes) VALUES (?, ?, ?, ?, ?, ?)",
         )
         .run(relPath, mtime, language, lineCount, symbolCount, size);
+
       fileId = Number(inserted.lastInsertRowid);
     }
+
     this.fileIdByPath.set(relPath, fileId);
 
     if (outline && lines) {
@@ -1054,6 +1107,7 @@ export class RepoMap {
       const seen = new Set<string>();
 
       const MAX_SYMBOLS_PER_FILE = 10_000;
+
       const pending: Array<{
         name: string;
         kind: string;
@@ -1063,9 +1117,11 @@ export class RepoMap {
         sig: string | null;
         qualifiedName: string | null;
       }> = [];
+
       for (const sym of outline.symbols) {
         if (pending.length >= MAX_SYMBOLS_PER_FILE) break;
         const key = `${sym.name}:${String(sym.location.line)}`;
+
         if (seen.has(key)) continue;
         seen.add(key);
 
@@ -1076,6 +1132,7 @@ export class RepoMap {
           if (!exportedNames.has(sym.name)) {
             const srcLine = lines[sym.location.line - 1] ?? "";
             const indent = srcLine.length - srcLine.trimStart().length;
+
             if (indent > 2) continue; // local variable — skip
           }
         }
@@ -1095,12 +1152,15 @@ export class RepoMap {
       // container). Top-level stays null. e.g. AgentBus.dispatch
       const fileSyms = [...pending].sort((a, b) => a.line - b.line);
       const containers = fileSyms.filter((s) => CONTAINER_KINDS.has(s.kind) && s.endLine > s.line);
+
       if (containers.length > 0) {
         // Smallest span first so the first enclosing match is the tightest.
         containers.sort((a, b) => a.endLine - a.line - (b.endLine - b.line));
+
         for (const sym of fileSyms) {
           for (const c of containers) {
             if (c === sym) continue;
+
             if (c.line <= sym.line && c.endLine >= sym.endLine) {
               sym.qualifiedName = `${c.name}.${sym.name}`;
               break;
@@ -1288,6 +1348,7 @@ export class RepoMap {
   private extractIdentifiers(content: string, language: Language): Set<string> {
     const ids = new Set<string>();
     const lisp = language === "elisp";
+
     const pattern = lisp
       ? LISP_IDENT_RE
       : SNAKE_IDENT_LANGUAGES.has(language)
@@ -1296,20 +1357,26 @@ export class RepoMap {
 
     for (const match of content.matchAll(pattern)) {
       const id = match[1];
+
       if (!id) continue;
+
       if (id.length > 3 && id.length < 60 && !IDENTIFIER_KEYWORDS.has(id)) ids.add(id);
       // Opposite-case hyphen suffix: the second historic regex was a separate greedy scan.
       if (lisp) {
         const start = id.charCodeAt(0);
         const wantUpper = start >= 97 && start <= 122;
+
         for (let i = 0; i < id.length - 1; i++) {
           if (id.charCodeAt(i) !== 45 /* - */) continue;
           const c = id.charCodeAt(i + 1);
+
           if (wantUpper ? c < 65 || c > 90 : c < 97 || c > 122) continue;
           const suffix = id.slice(i + 1);
+
           if (suffix.length > 3 && suffix.length < 60 && !IDENTIFIER_KEYWORDS.has(suffix)) {
             ids.add(suffix);
           }
+
           break;
         }
       }
@@ -1483,6 +1550,7 @@ export class RepoMap {
       const relPath = relative(this.cwd, candidate);
       if (relPath.startsWith("..")) continue;
       const id = this.fileIdByPath.get(relPath);
+
       if (id !== undefined) return id;
     }
     return null;
@@ -1547,6 +1615,7 @@ export class RepoMap {
       });
       tx();
       if (i % 2000 === 0) this.onProgress?.(-1, -1); // heartbeat
+
       if (i + BATCH < unresolvedIds.length) if (this.onProgress) await this.yieldToUi();
     }
   }
@@ -1585,6 +1654,7 @@ export class RepoMap {
       });
       tx();
       if (i % 1000 === 0) this.onProgress?.(-1, -1); // heartbeat
+
       if (i + BATCH < unresolved.length) if (this.onProgress) await this.yieldToUi();
     }
 
@@ -1639,6 +1709,7 @@ export class RepoMap {
       });
       tx();
       if (!changed) break;
+
       if (this.onProgress) await this.yieldToUi();
     }
   }
@@ -1684,6 +1755,7 @@ export class RepoMap {
     for (let i = 0; i < trueImportRows.length; i++) {
       const row = trueImportRows[i] as (typeof trueImportRows)[number];
       addEdge(row.source_file_id, row.target_file_id, Math.sqrt(row.ref_count) * 3, 3);
+
       if (i % 500 === 499) if (this.onProgress) await this.yieldToUi();
       if (i % 2000 === 0) this.onProgress?.(-3, -3);
     }
@@ -1732,12 +1804,14 @@ export class RepoMap {
       if (!isCompound && row.name.length < 10) w *= 0.1;
       if (row.name.startsWith("_")) w *= 0.1;
       addEdge(row.source_file_id, row.target_file_id, w, 1);
+
       if (i % 500 === 499) if (this.onProgress) await this.yieldToUi();
       if (i % 2000 === 0) this.onProgress?.(-3, -3);
     }
 
     // Phase 2: Inferred edges (confidence=1) — unique exports only + BM25 IDF
     this.onProgress?.(-3, -3);
+
     if (this.onProgress) await this.yieldToUi();
 
     // Pre-compute export uniqueness to avoid correlated subquery in the main JOIN
@@ -1783,6 +1857,7 @@ export class RepoMap {
       if (row.name.startsWith("_")) w *= 0.1;
 
       addEdge(row.source_file_id, row.target_file_id, w, 1);
+
       if (i % 500 === 499) if (this.onProgress) await this.yieldToUi();
       if (i % 2000 === 0) this.onProgress?.(-3, -3);
     }
@@ -1890,6 +1965,7 @@ export class RepoMap {
         // database locked — edges will be rebuilt on next flush
       }
       if (i % 2000 === 0) this.onProgress?.(-3, -3);
+
       if (i + BATCH < entries.length) if (this.onProgress) await this.yieldToUi();
     }
   }
@@ -2187,6 +2263,7 @@ export class RepoMap {
       let delta = 0;
       for (let i = 0; i < n; i++) delta += Math.abs((next[i] ?? 0) - (rank[i] ?? 0));
       [rank, next] = [next, rank];
+
       if (iter % 5 === 4) if (this.onProgress) await this.yieldToUi();
       if (delta < 1e-6) break;
     }
@@ -2304,11 +2381,13 @@ export class RepoMap {
   ): void {
     const n = files.length;
     const changed: number[] = [];
+
     for (let i = 0; i < n; i++) {
       if (Math.abs((rank[i] ?? 0) - (files[i]?.pagerank ?? 0)) >= 1e-9) {
         changed.push(i);
       }
     }
+
     if (changed.length === 0) return;
 
     const update = this.db.prepare("UPDATE files SET pagerank = ? WHERE id = ?");
@@ -2398,6 +2477,7 @@ export class RepoMap {
       }
       if (ci % 50 === 0) {
         this.onProgress?.(-5, -5);
+
         if (this.onProgress) await this.yieldToUi(); // yield so heartbeat can be delivered
       }
     }
@@ -2954,6 +3034,9 @@ export class RepoMap {
     }
 
     if (count > 0) {
+      // Keep the cached presence flag accurate: flushReindex → indexFile
+      // consults it to re-link LLM summaries after symbol IDs change.
+      this.hasLlmSummaries = true;
       try {
         this.db.run("PRAGMA wal_checkpoint(PASSIVE)");
       } catch {}
@@ -3048,6 +3131,12 @@ export class RepoMap {
 
     const process = async () => {
       await this.ensureTreeSitter();
+      // outlineFromContent needs a loaded grammar. Warm boots (nothing to
+      // index) and edits in not-yet-seen languages would otherwise re-index
+      // with zero symbols, silently dropping the file from the map.
+      if (this.treeSitter) {
+        await this.treeSitter.ensureGrammars([...batch.keys()]);
+      }
       for (const [absPath, { relPath, language }] of batch) {
         try {
           const st = await statAsync(absPath);
@@ -3120,6 +3209,7 @@ export class RepoMap {
     for (let i = 0; i < filesWithImports.length; i++) {
       const file = filesWithImports[i] as (typeof filesWithImports)[number];
       const cached = this.scanContents?.get(file.path);
+
       if (cached !== undefined) {
         fileContents.set(file.id, cached.split("\n"));
       } else {
@@ -3132,6 +3222,7 @@ export class RepoMap {
           );
         }
       }
+
       if (i % 20 === 19) if (this.onProgress) await this.yieldToUi();
     }
 
@@ -3217,7 +3308,9 @@ export class RepoMap {
       });
       tx();
       if (batchStart % (BATCH_SIZE * 10) === 0) this.onProgress?.(-2, -2); // heartbeat
-      if (batchStart + BATCH_SIZE < filesWithImports.length) if (this.onProgress) await this.yieldToUi();
+
+      if (batchStart + BATCH_SIZE < filesWithImports.length)
+        if (this.onProgress) await this.yieldToUi();
     }
   }
 
@@ -3232,10 +3325,12 @@ export class RepoMap {
   private async flushAsync(): Promise<void> {
     try {
       await this.buildCallGraph();
+
       if (this.onProgress) await this.yieldToUi();
       await this.buildEdges();
       this.linkTestFiles();
       this.rescueOrphans();
+
       if (this.onProgress) await this.yieldToUi();
       await this.computePageRank();
     } catch {
@@ -4392,14 +4487,18 @@ export class RepoMap {
   /** Compute shape hashes + token signatures for files the scan skipped. */
   private async ensureCloneHashes(): Promise<void> {
     if (!this.ready) return;
+
     if (this.cloneFillInflight) return this.cloneFillInflight;
+
     const pending = this.db
       .query<{ c: number }, []>("SELECT 1 as c FROM files WHERE clone_ready = 0 LIMIT 1")
       .get();
+
     if (!pending) return;
     this.cloneFillInflight = this.fillMissingCloneHashes().finally(() => {
       this.cloneFillInflight = null;
     });
+
     return this.cloneFillInflight;
   }
 
@@ -4417,6 +4516,7 @@ export class RepoMap {
     this.db.query("DELETE FROM token_fragments WHERE file_id = ?").run(fileId);
 
     const symbolCount = symbols?.length ?? 0;
+
     if (lineCount > CLONE_MAX_LINES || symbolCount > CLONE_MAX_SYMBOLS) return;
 
     if (hashes && hashes.length > 0) {
@@ -4424,11 +4524,13 @@ export class RepoMap {
         const insertHash = this.db.prepare(
           "INSERT INTO shape_hashes (file_id, name, kind, line, end_line, shape_hash, node_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
         );
+
         const hashTx = this.db.transaction(() => {
           for (const h of hashes) {
             insertHash.run(fileId, h.name, h.kind, h.line, h.endLine, h.shapeHash, h.nodeCount);
           }
         });
+
         hashTx();
       } catch {
         // skip shape hashing on insert error
@@ -4450,11 +4552,14 @@ export class RepoMap {
         "SELECT id, path, line_count, symbol_count FROM files WHERE clone_ready = 0",
       )
       .all();
+
     if (pending.length === 0) return;
 
     await this.ensureTreeSitter();
+
     if (!this.treeSitter) {
       this.db.query("UPDATE files SET clone_ready = 1 WHERE clone_ready = 0").run();
+
       return;
     }
 
@@ -4465,6 +4570,7 @@ export class RepoMap {
       const file = pending[i] as (typeof pending)[number];
       const absPath = join(this.cwd, file.path);
       let content = this.scanContents?.get(file.path);
+
       if (content === undefined) {
         try {
           content = readFileSync(absPath, "utf-8");
@@ -4475,6 +4581,7 @@ export class RepoMap {
       }
 
       let parsed: Awaited<ReturnType<typeof backend.getFileOutline>> = null;
+
       try {
         parsed = await backend.getFileOutline(absPath, { shapeHashes: true, content });
       } catch (err) {
@@ -5603,6 +5710,7 @@ export class RepoMap {
   private ensureTrigramPostingCounts(): Map<number, number> {
     if (this.trigramPostingCounts) return this.trigramPostingCounts;
     const counts = new Map<number, number>();
+
     for (const row of this.db
       .query<{ trigram: number; c: number }, []>(
         "SELECT trigram, COUNT(*) AS c FROM trigrams GROUP BY trigram",
@@ -5610,21 +5718,28 @@ export class RepoMap {
       .all()) {
       counts.set(row.trigram, row.c);
     }
+
     this.trigramPostingCounts = counts;
+
     return counts;
   }
 
   /** Drop one file's postings and decrement the in-memory counts when they exist. */
   private forgetFileTrigrams(fileId: number): void {
     const counts = this.trigramPostingCounts;
+
     if (counts) {
       const rows = this.db
         .query<{ trigram: number }, [number]>("SELECT trigram FROM trigrams WHERE file_id = ?")
         .all(fileId);
+
       this.db.query("DELETE FROM trigrams WHERE file_id = ?").run(fileId);
+
       for (const row of rows) {
         const n = counts.get(row.trigram);
+
         if (n === undefined) continue;
+
         if (n <= 1) counts.delete(row.trigram);
         else counts.set(row.trigram, n - 1);
       }

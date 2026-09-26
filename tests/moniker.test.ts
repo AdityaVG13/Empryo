@@ -110,14 +110,17 @@ export class DependencyFailedError {
     );
     repoMap = new RepoMap(dir);
     await repoMap.scan();
-    const db = (repoMap as unknown as { db: { query: (sql: string) => { all: () => unknown[] } } })
-      .db;
+
+    // @ts-expect-error — private member access for test
+    const db: { query: (sql: string) => { all: () => unknown[] } } = repoMap.db;
+
     const rows = db.query("SELECT name, kind, qualified_name, moniker FROM symbols").all() as Array<{
       name: string;
       kind: string;
       qualified_name: string | null;
       moniker: string | null;
     }>;
+
     const dispatch = rows.find((r) => r.name === "dispatch");
     expect(dispatch?.qualified_name).toBe("AgentBus.dispatch");
     expect(dispatch?.moniker).toBe(`bus#AgentBus.dispatch(${dispatch?.kind})`);

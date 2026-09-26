@@ -63,23 +63,7 @@ const REPEAT_CALL_WINDOW = 8;
 
 const READ_TOOL_NAMES = new Set(["read", "navigate", "soul_find", "list_dir"]);
 
-/** Cached JSON.stringify of tool-call inputs. Inputs are immutable; WeakMap
- *  lets evicted step objects GC their entries. Primitives are not cached. */
-const inputJsonCache = new WeakMap<object, string>();
-
-function stringifyToolInput(input: unknown): string {
-  if (input !== null && typeof input === "object") {
-    const hit = inputJsonCache.get(input);
-    if (hit !== undefined) return hit;
-    let argStr: string;
-    try {
-      argStr = JSON.stringify(input);
-    } catch {
-      argStr = "{}";
-    }
-    inputJsonCache.set(input, argStr);
-    return argStr;
-  }
+function safeJsonStringify(input: unknown): string {
   try {
     return JSON.stringify(input ?? {});
   } catch {
@@ -99,6 +83,24 @@ export function detectRepeatedCalls(
   threshold = REPEAT_CALL_THRESHOLD,
 ): { toolName: string; count: number; signature: string } | null {
   const counts = new Map<string, { toolName: string; count: number }>();
+  // Per-call memo of object serializations. Deliberately not shared across
+  // calls: inputs are mutable, so an identity cache would return a stale
+  // signature after a caller mutates an input object in place.
+  const seen = new Map<object, string>();
+
+  const stringifyToolInput = (input: unknown): string => {
+    if (input !== null && typeof input === "object") {
+      const hit = seen.get(input);
+
+      if (hit !== undefined) return hit;
+      const argStr = safeJsonStringify(input);
+      seen.set(input, argStr);
+
+      return argStr;
+    }
+
+    return safeJsonStringify(input);
+  };
   const start = Math.max(0, steps.length - window);
   for (let i = start; i < steps.length; i++) {
     const calls = steps[i]?.toolCalls;

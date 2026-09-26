@@ -8,11 +8,13 @@ import {
 } from "../src/core/intelligence/backends/tree-sitter.js";
 
 const TMP = join(tmpdir(), `ts-query-cache-${Date.now()}`);
+
 const backend = new TreeSitterBackend();
 
 function writeTemp(name: string, content: string): string {
   const path = join(TMP, name);
   writeFileSync(path, content);
+
   return path;
 }
 
@@ -33,6 +35,7 @@ describe("tree-sitter query cache", () => {
 export function alpha() { return 1; }
 `,
     );
+
     const b = writeTemp(
       "b.ts",
       `export function beta() { return 2; }

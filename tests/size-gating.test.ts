@@ -4,8 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RepoMap } from "../src/core/intelligence/repo-map.js";
 
-type Compactable = { compactIfNeeded: () => void };
-
 let dir: string;
 
 afterEach(() => {
@@ -39,8 +37,10 @@ test("rescan skips an unchanged file (mtime+size both equal)", async () => {
   mkdirSync(join(dir, "src"), { recursive: true });
   writeFileSync(join(dir, "src", "b.ts"), "export function keep() { return 1; }\n");
 
-  const compactSpy = spyOn(RepoMap.prototype as unknown as Compactable, "compactIfNeeded");
+  // @ts-expect-error — spying a private method for test
+  const compactSpy = spyOn(RepoMap.prototype, "compactIfNeeded");
   const rm = new RepoMap(dir);
+
   try {
     await rm.scan();
     expect(compactSpy).toHaveBeenCalled();

@@ -646,6 +646,7 @@ describe("AgentBus — tool result cache", () => {
       [readOther, "r-other"],
       [web, "web"],
     ];
+
     for (const [key, value] of entries) {
       bus.cacheToolResult("a1", key, value);
     }
@@ -655,15 +656,17 @@ describe("AgentBus — tool result cache", () => {
     expect(bus.acquireToolResult("a2", grepHit).hit).toBe(false);
     expect(bus.acquireToolResult("a2", grepRoot).hit).toBe(false);
     expect(bus.acquireToolResult("a2", globHit).hit).toBe(false);
+    expect(bus.acquireToolResult("a2", readEdited).hit).toBe(false);
 
     const stillHit = (key: string, value: string) => {
       const r = bus.acquireToolResult("a2", key);
       expect(r.hit).toBe(true);
+
       if (r.hit === true) expect(r.result).toBe(value);
     };
+
     stillHit(grepMiss, "g-miss");
     stillHit(globMiss, "gl-miss");
-    stillHit(readEdited, "r-edit");
     stillHit(readOther, "r-other");
     stillHit(web, "web");
   });
