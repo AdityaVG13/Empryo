@@ -224,6 +224,8 @@ export class RepoMap {
   private trigramPostingCounts: Map<number, number> | null = null;
   /** Scan-local file bodies so call-graph can skip a second read of just-indexed files. */
   private scanContents: Map<string, string> | null = null;
+  /** path → files.id. Hydrated at scan start, maintained on insert/delete. */
+  private fileIdByPath = new Map<string, number>();
   /** Coalesce concurrent clone-search fills after a scan that skipped hashing. */
   private cloneFillInflight: Promise<void> | null = null;
 
@@ -665,6 +667,7 @@ export class RepoMap {
       }
 
       const existingFiles = new Map<string, { id: number; mtime_ms: number; size_bytes: number }>();
+      this.fileIdByPath.clear();
       for (const row of this.db
         .query<{ id: number; path: string; mtime_ms: number; size_bytes: number }, []>(
           "SELECT id, path, mtime_ms, size_bytes FROM files",
@@ -675,6 +678,7 @@ export class RepoMap {
           mtime_ms: row.mtime_ms,
           size_bytes: row.size_bytes,
         });
+        this.fileIdByPath.set(row.path, row.id);
       }
 
       const currentPaths = new Set<string>();
@@ -713,7 +717,10 @@ export class RepoMap {
       if (stale.length > 0 && staleRatio < 0.8) {
         const deleteFile = this.db.prepare("DELETE FROM files WHERE path = ?");
         const tx = this.db.transaction(() => {
-          for (const p of stale) deleteFile.run(p);
+          for (const p of stale) {
+            deleteFile.run(p);
+            this.fileIdByPath.delete(p);
+          }
         });
         tx();
         // CASCADE dropped trigram postings — counts are stale until rehydrated.
@@ -933,24 +940,23 @@ export class RepoMap {
     }
     const symbolCount = outline?.symbols.length ?? 0;
 
+    let fileId: number;
     if (existing) {
       this.db
         .query(
           "UPDATE files SET mtime_ms = ?, language = ?, line_count = ?, symbol_count = ?, size_bytes = ?, clone_ready = 0 WHERE id = ?",
         )
         .run(mtime, language, lineCount, symbolCount, size, existing.id);
+      fileId = existing.id;
     } else {
-      this.db
+      const inserted = this.db
         .query(
           "INSERT INTO files (path, mtime_ms, language, line_count, symbol_count, size_bytes) VALUES (?, ?, ?, ?, ?, ?)",
         )
         .run(relPath, mtime, language, lineCount, symbolCount, size);
+      fileId = Number(inserted.lastInsertRowid);
     }
-
-    const fileId =
-      existing?.id ??
-      (this.db.query<{ id: number }, [string]>("SELECT id FROM files WHERE path = ?").get(relPath)
-        ?.id as number);
+    this.fileIdByPath.set(relPath, fileId);
 
     if (outline) {
       const insertSym = this.db.prepare(
@@ -1437,10 +1443,8 @@ export class RepoMap {
     for (const candidate of candidates) {
       const relPath = relative(this.cwd, candidate);
       if (relPath.startsWith("..")) continue;
-      const row = this.db
-        .query<{ id: number }, [string]>("SELECT id FROM files WHERE path = ?")
-        .get(relPath);
-      if (row) return row.id;
+      const id = this.fileIdByPath.get(relPath);
+      if (id !== undefined) return id;
     }
     return null;
   }
@@ -5361,6 +5365,7 @@ export class RepoMap {
     this.db.run("DELETE FROM refs");
     this.db.run("DELETE FROM symbols");
     this.db.run("DELETE FROM files");
+    this.fileIdByPath.clear();
     this.trigramPostingCounts = null;
     this.rebuildFts();
     this.ready = false;
