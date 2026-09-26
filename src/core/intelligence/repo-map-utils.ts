@@ -387,18 +387,34 @@ async function collectFilesViaGit(dir: string): Promise<CollectedFile[] | null> 
     const text = await new Response(proc.stdout).text();
     if (code !== 0) return null;
 
-    const files: CollectedFile[] = [];
+    const candidates: string[] = [];
     for (const line of text.split("\n")) {
       if (!line) continue;
       if (!isIndexablePath(line)) continue;
       const fullPath = join(dir, line);
       if (isForbidden(fullPath)) continue;
-      try {
-        const s = await stat(fullPath);
-        if (s.size < MAX_FILE_SIZE)
-          files.push({ path: fullPath, mtimeMs: s.mtimeMs, size: s.size });
-      } catch {}
-      if (files.length % 50 === 0) await new Promise<void>((r) => setTimeout(r, 0));
+      candidates.push(fullPath);
+    }
+
+    if (candidates.length === 0) return [];
+
+    // Scan UI heartbeat is RepoMap.yieldToUi. Yield only on huge listings.
+    const WAVE = candidates.length > 5000 ? 2000 : candidates.length;
+    const files: CollectedFile[] = [];
+    for (let i = 0; i < candidates.length; i += WAVE) {
+      if (i > 0) await new Promise<void>((r) => queueMicrotask(r));
+      const chunk = candidates.slice(i, i + WAVE);
+      const batch = await Promise.all(
+        chunk.map(async (fullPath) => {
+          try {
+            const s = await stat(fullPath);
+            if (s.size < MAX_FILE_SIZE)
+              return { path: fullPath, mtimeMs: s.mtimeMs, size: s.size };
+          } catch {}
+          return null;
+        }),
+      );
+      for (const f of batch) if (f) files.push(f);
     }
     return files;
   } catch {
