@@ -4,6 +4,7 @@ import {
 	buildPrepareStep,
 	buildSymbolLookup,
 	compactOldToolResults,
+	detectRepeatedCalls,
 	KEEP_RECENT_MESSAGES,
 	type PrepareStepOptions,
 } from "../src/core/agents/step-utils.js";
@@ -1890,5 +1891,66 @@ describe("compactOldToolResults — realistic audit data", () => {
 		}
 
 		expect(savings).toBeGreaterThan(80);
+	});
+});
+
+describe("detectRepeatedCalls stringify cache", () => {
+	function makeStep(calls: Array<{ toolName: string; input?: unknown }>) {
+		return { toolCalls: calls };
+	}
+
+	it("identical input object twice yields the same signature", () => {
+		const input = { path: "a.ts", extra: "same-ref" };
+		const steps = [
+			makeStep([{ toolName: "read", input }]),
+			makeStep([{ toolName: "read", input }]),
+			makeStep([{ toolName: "read", input }]),
+		];
+		const first = detectRepeatedCalls(steps);
+		const second = detectRepeatedCalls(steps);
+		expect(first).not.toBeNull();
+		expect(second).not.toBeNull();
+		expect(first!.signature).toBe(second!.signature);
+		expect(first!.signature).toBe(`read::${JSON.stringify(input)}`);
+	});
+
+	it("mutating a new object changes the signature", () => {
+		const original = { path: "a.ts" };
+		const mutated = { path: "a.ts" };
+		mutated.path = "b.ts";
+		const stepsA = [
+			makeStep([{ toolName: "read", input: original }]),
+			makeStep([{ toolName: "read", input: original }]),
+			makeStep([{ toolName: "read", input: original }]),
+		];
+		const stepsB = [
+			makeStep([{ toolName: "read", input: mutated }]),
+			makeStep([{ toolName: "read", input: mutated }]),
+			makeStep([{ toolName: "read", input: mutated }]),
+		];
+		const a = detectRepeatedCalls(stepsA);
+		const b = detectRepeatedCalls(stepsB);
+		expect(a).not.toBeNull();
+		expect(b).not.toBeNull();
+		expect(a!.signature).not.toBe(b!.signature);
+		expect(a!.signature).toBe(`read::${JSON.stringify({ path: "a.ts" })}`);
+		expect(b!.signature).toBe(`read::${JSON.stringify({ path: "b.ts" })}`);
+	});
+
+	it("1000 calls with a 2KB input object stay consistent", () => {
+		const input = { blob: "x".repeat(2048) };
+		const steps = Array.from({ length: 8 }, () =>
+			makeStep([{ toolName: "read", input }]),
+		);
+		const t0 = performance.now();
+		let last: ReturnType<typeof detectRepeatedCalls> = null;
+		for (let i = 0; i < 1000; i++) {
+			last = detectRepeatedCalls(steps);
+		}
+		const ms = performance.now() - t0;
+		expect(last).not.toBeNull();
+		expect(last!.count).toBe(8);
+		expect(last!.signature).toBe(`read::${JSON.stringify(input)}`);
+		console.log(`detectRepeatedCalls x1000 (2KB input): ${ms.toFixed(2)}ms`);
 	});
 });

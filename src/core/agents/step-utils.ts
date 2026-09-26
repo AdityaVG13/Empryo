@@ -63,6 +63,30 @@ const REPEAT_CALL_WINDOW = 8;
 
 const READ_TOOL_NAMES = new Set(["read", "navigate", "soul_find", "list_dir"]);
 
+/** Cached JSON.stringify of tool-call inputs. Inputs are immutable; WeakMap
+ *  lets evicted step objects GC their entries. Primitives are not cached. */
+const inputJsonCache = new WeakMap<object, string>();
+
+function stringifyToolInput(input: unknown): string {
+  if (input !== null && typeof input === "object") {
+    const hit = inputJsonCache.get(input);
+    if (hit !== undefined) return hit;
+    let argStr: string;
+    try {
+      argStr = JSON.stringify(input);
+    } catch {
+      argStr = "{}";
+    }
+    inputJsonCache.set(input, argStr);
+    return argStr;
+  }
+  try {
+    return JSON.stringify(input ?? {});
+  } catch {
+    return "{}";
+  }
+}
+
 /**
  * Detect degenerate tool-call loops: same tool + same args repeated across recent steps.
  * Returns the worst offender (highest repeat count) or null.
@@ -80,13 +104,7 @@ export function detectRepeatedCalls(
     const calls = steps[i]?.toolCalls;
     if (!calls) continue;
     for (const tc of calls) {
-      let argStr: string;
-      try {
-        argStr = JSON.stringify(tc.input ?? {});
-      } catch {
-        argStr = "{}";
-      }
-      const sig = `${tc.toolName}::${argStr}`;
+      const sig = `${tc.toolName}::${stringifyToolInput(tc.input)}`;
       const entry = counts.get(sig);
       if (entry) entry.count++;
       else counts.set(sig, { toolName: tc.toolName, count: 1 });
