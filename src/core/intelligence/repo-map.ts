@@ -45,9 +45,8 @@ import { detectLanguageFromPath } from "./types.js";
  *  Matches ripgrep's --max-filesize=256K cap used by soul_grep. */
 const TRIGRAM_MAX_FILE_BYTES = 256 * 1024;
 
-/** Skip clone shape/token hashing on giant files (the 6 files in this
- *  tree above 2k lines). Duplicate-function search on a 5k-line AST is
- *  the serializeShape hotspot; sub-3k-line files still get hashed. */
+/** Clone shape/token hashing is deferred until clone search. Giant files
+ *  stay excluded then (serializeShape hotspot on 5k-line ASTs). */
 const CLONE_MAX_LINES = 3000;
 const CLONE_MAX_SYMBOLS = 1500;
 
@@ -225,6 +224,8 @@ export class RepoMap {
   private trigramPostingCounts: Map<number, number> | null = null;
   /** Scan-local file bodies so call-graph can skip a second read of just-indexed files. */
   private scanContents: Map<string, string> | null = null;
+  /** Coalesce concurrent clone-search fills after a scan that skipped hashing. */
+  private cloneFillInflight: Promise<void> | null = null;
 
   constructor(cwd: string) {
     this.cwd = cwd;
@@ -454,6 +455,16 @@ export class RepoMap {
     // Migration: add is_barrel flag to files
     try {
       this.db.run("ALTER TABLE files ADD COLUMN is_barrel INTEGER NOT NULL DEFAULT 0");
+    } catch {}
+
+    // Clone hashes are filled on first clone search, not during scan.
+    try {
+      this.db.run("ALTER TABLE files ADD COLUMN clone_ready INTEGER NOT NULL DEFAULT 0");
+      this.db.run(`
+        UPDATE files SET clone_ready = 1
+        WHERE id IN (SELECT DISTINCT file_id FROM shape_hashes)
+           OR id IN (SELECT DISTINCT file_id FROM token_signatures)
+      `);
     } catch {}
 
     // Migration: add confidence tier to edges
@@ -911,16 +922,9 @@ export class RepoMap {
     this.scanContents?.set(relPath, content);
 
     let outline: import("./types.js").FileOutline | null = null;
-    let shapeHashes: import("./backends/tree-sitter.js").ShapeHash[] | null = null;
-    const wantCloneShape = lineCount <= CLONE_MAX_LINES;
     if (this.treeSitter) {
       try {
-        const parsed = await this.treeSitter.getFileOutline(absPath, {
-          shapeHashes: wantCloneShape,
-          content,
-        });
-        outline = parsed ?? null;
-        shapeHashes = parsed?.shapeHashes ?? null;
+        outline = await this.treeSitter.getFileOutline(absPath, { content });
       } catch (err) {
         this.onError?.(
           `Tree-sitter parse error on ${relPath}: ${err instanceof Error ? err.message : String(err)}`,
@@ -928,14 +932,11 @@ export class RepoMap {
       }
     }
     const symbolCount = outline?.symbols.length ?? 0;
-    if (!wantCloneShape || symbolCount > CLONE_MAX_SYMBOLS) {
-      shapeHashes = null;
-    }
 
     if (existing) {
       this.db
         .query(
-          "UPDATE files SET mtime_ms = ?, language = ?, line_count = ?, symbol_count = ?, size_bytes = ? WHERE id = ?",
+          "UPDATE files SET mtime_ms = ?, language = ?, line_count = ?, symbol_count = ?, size_bytes = ?, clone_ready = 0 WHERE id = ?",
         )
         .run(mtime, language, lineCount, symbolCount, size, existing.id);
     } else {
@@ -1112,27 +1113,6 @@ export class RepoMap {
 
       if (this.semanticMode === "ast" || this.semanticMode === "on") {
         this.extractAstSummaries(fileId, relPath, outline.symbols, exportedNames, lines, mtime);
-      }
-
-      if (shapeHashes && shapeHashes.length > 0) {
-        const hashes = shapeHashes;
-        try {
-          const insertHash = this.db.prepare(
-            "INSERT INTO shape_hashes (file_id, name, kind, line, end_line, shape_hash, node_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
-          );
-          const hashTx = this.db.transaction(() => {
-            for (const h of hashes) {
-              insertHash.run(fileId, h.name, h.kind, h.line, h.endLine, h.shapeHash, h.nodeCount);
-            }
-          });
-          hashTx();
-        } catch {
-          // skip shape hashing on insert error
-        }
-      }
-
-      if (wantCloneShape && symbolCount <= CLONE_MAX_SYMBOLS) {
-        this.extractTokenSignatures(fileId, outline.symbols, content);
       }
     }
 
@@ -4358,6 +4338,115 @@ export class RepoMap {
     );
   }
 
+  /** Compute shape hashes + token signatures for files the scan skipped. */
+  private async ensureCloneHashes(): Promise<void> {
+    if (!this.ready) return;
+    if (this.cloneFillInflight) return this.cloneFillInflight;
+    const pending = this.db
+      .query<{ c: number }, []>("SELECT 1 as c FROM files WHERE clone_ready = 0 LIMIT 1")
+      .get();
+    if (!pending) return;
+    this.cloneFillInflight = this.fillMissingCloneHashes().finally(() => {
+      this.cloneFillInflight = null;
+    });
+    return this.cloneFillInflight;
+  }
+
+  private persistCloneArtifacts(
+    fileId: number,
+    hashes: import("./backends/tree-sitter.js").ShapeHash[] | null | undefined,
+    symbols:
+      | Array<{ name: string; kind: string; location: { line: number; endLine?: number } }>
+      | undefined,
+    content: string,
+    lineCount: number,
+  ): void {
+    this.db.query("DELETE FROM shape_hashes WHERE file_id = ?").run(fileId);
+    this.db.query("DELETE FROM token_signatures WHERE file_id = ?").run(fileId);
+    this.db.query("DELETE FROM token_fragments WHERE file_id = ?").run(fileId);
+
+    const symbolCount = symbols?.length ?? 0;
+    if (lineCount > CLONE_MAX_LINES || symbolCount > CLONE_MAX_SYMBOLS) return;
+
+    if (hashes && hashes.length > 0) {
+      try {
+        const insertHash = this.db.prepare(
+          "INSERT INTO shape_hashes (file_id, name, kind, line, end_line, shape_hash, node_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        );
+        const hashTx = this.db.transaction(() => {
+          for (const h of hashes) {
+            insertHash.run(fileId, h.name, h.kind, h.line, h.endLine, h.shapeHash, h.nodeCount);
+          }
+        });
+        hashTx();
+      } catch {
+        // skip shape hashing on insert error
+      }
+    }
+
+    if (symbols) this.extractTokenSignatures(fileId, symbols, content);
+  }
+
+  private async fillMissingCloneHashes(): Promise<void> {
+    this.db
+      .query(
+        "UPDATE files SET clone_ready = 1 WHERE clone_ready = 0 AND (line_count > ? OR symbol_count > ?)",
+      )
+      .run(CLONE_MAX_LINES, CLONE_MAX_SYMBOLS);
+
+    const pending = this.db
+      .query<{ id: number; path: string; line_count: number; symbol_count: number }, []>(
+        "SELECT id, path, line_count, symbol_count FROM files WHERE clone_ready = 0",
+      )
+      .all();
+    if (pending.length === 0) return;
+
+    await this.ensureTreeSitter();
+    if (!this.treeSitter) {
+      this.db.query("UPDATE files SET clone_ready = 1 WHERE clone_ready = 0").run();
+      return;
+    }
+
+    const markReady = this.db.prepare("UPDATE files SET clone_ready = 1 WHERE id = ?");
+    const backend = this.treeSitter;
+
+    for (let i = 0; i < pending.length; i++) {
+      const file = pending[i] as (typeof pending)[number];
+      const absPath = join(this.cwd, file.path);
+      let content = this.scanContents?.get(file.path);
+      if (content === undefined) {
+        try {
+          content = readFileSync(absPath, "utf-8");
+        } catch {
+          markReady.run(file.id);
+          continue;
+        }
+      }
+
+      let parsed: Awaited<ReturnType<typeof backend.getFileOutline>> = null;
+      try {
+        parsed = await backend.getFileOutline(absPath, { shapeHashes: true, content });
+      } catch (err) {
+        this.onError?.(
+          `Clone hash error on ${file.path}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        markReady.run(file.id);
+        continue;
+      }
+
+      this.persistCloneArtifacts(
+        file.id,
+        parsed?.shapeHashes,
+        parsed?.symbols,
+        content,
+        file.line_count,
+      );
+      markReady.run(file.id);
+
+      if (i % 20 === 19) await this.yieldToUi();
+    }
+  }
+
   private extractTokenSignatures(
     fileId: number,
     symbols: Array<{ name: string; kind: string; location: { line: number; endLine?: number } }>,
@@ -4401,15 +4490,18 @@ export class RepoMap {
     tx();
   }
 
-  getNearDuplicates(
+  async getNearDuplicates(
     threshold = 0.8,
     limit = 20,
-  ): Array<{
-    similarity: number;
-    a: { name: string; path: string; line: number; endLine: number };
-    b: { name: string; path: string; line: number; endLine: number };
-  }> {
+  ): Promise<
+    Array<{
+      similarity: number;
+      a: { name: string; path: string; line: number; endLine: number };
+      b: { name: string; path: string; line: number; endLine: number };
+    }>
+  > {
     if (!this.ready) return [];
+    await this.ensureCloneHashes();
 
     const rows = this.db
       .query<
@@ -4515,11 +4607,14 @@ export class RepoMap {
     return pairs.slice(0, limit);
   }
 
-  getRepeatedFragments(limit = 20): Array<{
-    count: number;
-    locations: Array<{ name: string; path: string; line: number }>;
-  }> {
+  async getRepeatedFragments(limit = 20): Promise<
+    Array<{
+      count: number;
+      locations: Array<{ name: string; path: string; line: number }>;
+    }>
+  > {
     if (!this.ready) return [];
+    await this.ensureCloneHashes();
 
     const clusters = this.db
       .query<{ hash: string; cnt: number }, [number]>(
@@ -4562,13 +4657,16 @@ export class RepoMap {
     return results;
   }
 
-  getDuplicateStructures(limit = 20): Array<{
-    shapeHash: string;
-    kind: string;
-    nodeCount: number;
-    members: Array<{ name: string; path: string; line: number; endLine: number }>;
-  }> {
+  async getDuplicateStructures(limit = 20): Promise<
+    Array<{
+      shapeHash: string;
+      kind: string;
+      nodeCount: number;
+      members: Array<{ name: string; path: string; line: number; endLine: number }>;
+    }>
+  > {
     if (!this.ready) return [];
+    await this.ensureCloneHashes();
 
     const clusters = this.db
       .query<
@@ -4621,13 +4719,16 @@ export class RepoMap {
     return results;
   }
 
-  getFileDuplicates(relPath: string): Array<{
-    name: string;
-    line: number;
-    similarity: number;
-    clones: Array<{ name: string; path: string; line: number }>;
-  }> {
+  async getFileDuplicates(relPath: string): Promise<
+    Array<{
+      name: string;
+      line: number;
+      similarity: number;
+      clones: Array<{ name: string; path: string; line: number }>;
+    }>
+  > {
     if (!this.ready) return [];
+    await this.ensureCloneHashes();
 
     const fileRow = this.db
       .query<{ id: number }, [string]>("SELECT id FROM files WHERE path = ?")
