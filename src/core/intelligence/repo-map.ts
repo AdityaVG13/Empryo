@@ -5761,13 +5761,20 @@ export class RepoMap {
       "INSERT OR IGNORE INTO trigrams (trigram, file_id) VALUES (?, ?)",
     );
     const insert = this.stmtInsertTrigram;
-    this.runInTx(() => {
-      for (const tri of trigrams) {
-        if ((counts.get(tri) ?? 0) >= MAX_POSTINGS_PER_TRIGRAM) continue;
-        insert.run(tri, fileId);
-        counts.set(tri, (counts.get(tri) ?? 0) + 1);
-      }
-    });
+    try {
+      this.runInTx(() => {
+        for (const tri of trigrams) {
+          if ((counts.get(tri) ?? 0) >= MAX_POSTINGS_PER_TRIGRAM) continue;
+          insert.run(tri, fileId);
+          counts.set(tri, (counts.get(tri) ?? 0) + 1);
+        }
+      });
+    } catch (err) {
+      // The tx rolled back but counts were already incremented — drop the map
+      // so the next file rehydrates from SQLite instead of over-counting.
+      this.trigramPostingCounts = null;
+      throw err;
+    }
   }
 
   /**
