@@ -875,11 +875,14 @@ export class TreeSitterBackend implements IntelligenceBackend {
         const mainQuery = createQuery(tsLang, mainQueryStr, grammarKey);
         const matches = mainQuery.matches(tree.rootNode);
         for (const match of matches) {
-          const nameCapture = match.captures.find((c: TSQueryCapture) => c.name === "name");
-          const sourceCapture = match.captures.find((c: TSQueryCapture) => c.name === "source");
-          const patternCapture = match.captures.find(
-            (c: TSQueryCapture) => c.name !== "name" && c.name !== "source",
-          );
+          let nameCapture: TSQueryCapture | undefined;
+          let sourceCapture: TSQueryCapture | undefined;
+          let patternCapture: TSQueryCapture | undefined;
+          for (const c of match.captures) {
+            if (c.name === "name") nameCapture = c;
+            else if (c.name === "source") sourceCapture = c;
+            else patternCapture = c;
+          }
 
           // Handle imports
           if (patternCapture?.name === "import") {

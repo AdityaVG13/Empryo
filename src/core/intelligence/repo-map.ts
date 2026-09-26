@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import { Database, type Statement } from "bun:sqlite";
 import { chmodSync, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { stat as statAsync } from "node:fs/promises";
 import { dirname, extname, join, relative, resolve } from "node:path";
@@ -252,6 +252,15 @@ export class RepoMap {
   private fileIdByPath = new Map<string, number>();
   /** Coalesce concurrent clone-search fills after a scan that skipped hashing. */
   private cloneFillInflight: Promise<void> | null = null;
+  /** True while doScan holds BEGIN IMMEDIATE — skip inner SAVEPOINTs. */
+  private bulkIngest = false;
+  /** Cached: any paid LLM summary rows exist. Null until probed this scan. */
+  private hasLlmSummaries: boolean | null = null;
+  private stmtInsertSym: Statement | null = null;
+  private stmtInsertRef: Statement | null = null;
+  private stmtInsertTrigram: Statement | null = null;
+  private stmtInsertExt: Statement | null = null;
+  private stmtUpdateBarrel: Statement | null = null;
 
   constructor(cwd: string) {
     this.cwd = cwd;
@@ -659,6 +668,30 @@ export class RepoMap {
     return new Promise((r) => setTimeout(r, 1));
   }
 
+  /** Nested bun transactions are SAVEPOINTs; skip them inside bulk BEGIN. */
+  private runInTx(fn: () => void): void {
+    if (this.bulkIngest) {
+      fn();
+      return;
+    }
+    this.db.transaction(fn)();
+  }
+
+  private llmSummariesPresent(): boolean {
+    if (this.hasLlmSummaries !== null) return this.hasLlmSummaries;
+    try {
+      this.hasLlmSummaries =
+        this.db
+          .query<{ x: number }, []>(
+            "SELECT 1 AS x FROM semantic_summaries WHERE source = 'llm' LIMIT 1",
+          )
+          .get() != null;
+    } catch {
+      this.hasLlmSummaries = false;
+    }
+    return this.hasLlmSummaries;
+  }
+
   /** Drop btree secondary indexes so bulk inserts skip per-row index maintenance. */
   private dropSecondaryIndexes(): void {
     for (const { name } of SCAN_SECONDARY_INDEXES) {
@@ -762,6 +795,10 @@ export class RepoMap {
         // FTS5 triggers fire per INSERT/DELETE — defer and bulk-rebuild after COMMIT.
         this.db.run("DROP TRIGGER IF EXISTS symbols_ai");
         this.db.run("DROP TRIGGER IF EXISTS symbols_ad");
+        // FK checks on every child INSERT; we already delete children explicitly.
+        this.db.run("PRAGMA foreign_keys = OFF");
+        this.bulkIngest = true;
+        this.hasLlmSummaries = null;
         try {
           this.db.run("BEGIN IMMEDIATE");
           for (let i = 0; i < toIndex.length; i++) {
@@ -796,8 +833,12 @@ export class RepoMap {
           } catch {}
           throw err;
         } finally {
+          this.bulkIngest = false;
           this.createSecondaryIndexes();
           this.rebuildFts();
+          try {
+            this.db.run("PRAGMA foreign_keys = ON");
+          } catch {}
         }
         this.onProgress?.(toIndex.length, toIndex.length);
       }
@@ -923,7 +964,7 @@ export class RepoMap {
       .get(relPath);
 
     if (existing) {
-      this.db.transaction(() => {
+      this.runInTx(() => {
         this.db.query("DELETE FROM calls WHERE callee_file_id = ?").run(existing.id);
         this.db
           .query(
@@ -940,7 +981,7 @@ export class RepoMap {
         this.db
           .query("DELETE FROM edges WHERE source_file_id = ? OR target_file_id = ?")
           .run(existing.id, existing.id);
-      })();
+      });
     }
 
     let content: string;
@@ -998,9 +1039,10 @@ export class RepoMap {
     this.fileIdByPath.set(relPath, fileId);
 
     if (outline && lines) {
-      const insertSym = this.db.prepare(
+      this.stmtInsertSym ??= this.db.prepare(
         "INSERT INTO symbols (file_id, name, kind, line, end_line, is_exported, signature, qualified_name, moniker) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       );
+      const insertSym = this.stmtInsertSym;
       const exportedNames = new Set(outline.exports.map((e) => e.name));
       const seen = new Set<string>();
 
@@ -1063,7 +1105,7 @@ export class RepoMap {
       // Stable SCIP-style monikers: position-independent identity.
       // Uses qualified_name when present (nested), else the bare name.
       const mod = relPath.replace(/\.[^./]+$/, "");
-      const tx = this.db.transaction(() => {
+      this.runInTx(() => {
         for (const p of pending) {
           const descriptor = p.qualifiedName ?? p.name;
           insertSym.run(
@@ -1079,7 +1121,6 @@ export class RepoMap {
           );
         }
       });
-      tx();
 
       // Detect barrel files structurally:
       // A barrel file re-exports from other files with no/minimal original definitions.
@@ -1111,13 +1152,15 @@ export class RepoMap {
         else if (reexportCount >= 3 && originalDefs / (reexportCount + originalDefs + 1) < 0.2)
           isBarrel = true;
 
-        this.db.query("UPDATE files SET is_barrel = ? WHERE id = ?").run(isBarrel ? 1 : 0, fileId);
+        this.stmtUpdateBarrel ??= this.db.prepare("UPDATE files SET is_barrel = ? WHERE id = ?");
+        this.stmtUpdateBarrel.run(isBarrel ? 1 : 0, fileId);
       }
 
-      // Re-link orphaned LLM summaries to new symbol IDs (by file_path + symbol_name)
-      this.db
-        .query(
-          `UPDATE semantic_summaries SET symbol_id = (
+      // Re-link / prune paid LLM summaries only when any exist (default scan has none).
+      if (this.llmSummariesPresent()) {
+        this.db
+          .query(
+            `UPDATE semantic_summaries SET symbol_id = (
              SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id
              WHERE f.path = semantic_summaries.file_path AND s.name = semantic_summaries.symbol_name
              LIMIT 1
@@ -1127,16 +1170,15 @@ export class RepoMap {
                SELECT 1 FROM symbols s JOIN files f ON f.id = s.file_id
                WHERE f.path = semantic_summaries.file_path AND s.name = semantic_summaries.symbol_name
              )`,
-        )
-        .run(relPath);
-      // Clean up LLM summaries for symbols that were renamed/deleted from this file
-      // Only delete rows with populated file_path (backfilled rows) — never delete rows with empty file_path
-      this.db
-        .query(
-          `DELETE FROM semantic_summaries WHERE source = 'llm' AND file_path = ? AND file_path <> ''
+          )
+          .run(relPath);
+        this.db
+          .query(
+            `DELETE FROM semantic_summaries WHERE source = 'llm' AND file_path = ? AND file_path <> ''
            AND NOT EXISTS (SELECT 1 FROM symbols WHERE id = semantic_summaries.symbol_id)`,
-        )
-        .run(relPath);
+          )
+          .run(relPath);
+      }
 
       if (this.semanticMode === "ast" || this.semanticMode === "on") {
         this.extractAstSummaries(fileId, relPath, outline.symbols, exportedNames, lines, mtime);
@@ -1191,15 +1233,15 @@ export class RepoMap {
         for (const s of imp.specifiers) specs.add(s);
       }
       if (extImports.size > 0) {
-        const insertExt = this.db.prepare(
+        this.stmtInsertExt ??= this.db.prepare(
           "INSERT OR REPLACE INTO external_imports (file_id, package, specifiers) VALUES (?, ?, ?)",
         );
-        const tx = this.db.transaction(() => {
+        const insertExt = this.stmtInsertExt;
+        this.runInTx(() => {
           for (const [pkg, specs] of extImports) {
             insertExt.run(fileId, pkg, [...specs].join(","));
           }
         });
-        tx();
       }
     }
 
@@ -1224,15 +1266,15 @@ export class RepoMap {
     }
 
     if (resolvedRefs.length > 0) {
-      const insertRef = this.db.prepare(
+      this.stmtInsertRef ??= this.db.prepare(
         "INSERT INTO refs (file_id, name, source_file_id, import_source) VALUES (?, ?, ?, ?)",
       );
-      const tx = this.db.transaction(() => {
+      const insertRef = this.stmtInsertRef;
+      this.runInTx(() => {
         for (const ref of resolvedRefs) {
           insertRef.run(fileId, ref.name, ref.sourceFileId, ref.importSource);
         }
       });
-      tx();
     }
   }
 
@@ -5593,17 +5635,17 @@ export class RepoMap {
     const trigrams = extractContentTrigrams(content);
     if (trigrams.size === 0) return;
     const counts = this.ensureTrigramPostingCounts();
-    const insert = this.db.prepare(
+    this.stmtInsertTrigram ??= this.db.prepare(
       "INSERT OR IGNORE INTO trigrams (trigram, file_id) VALUES (?, ?)",
     );
-    const tx = this.db.transaction(() => {
+    const insert = this.stmtInsertTrigram;
+    this.runInTx(() => {
       for (const tri of trigrams) {
         if ((counts.get(tri) ?? 0) >= MAX_POSTINGS_PER_TRIGRAM) continue;
         insert.run(tri, fileId);
         counts.set(tri, (counts.get(tri) ?? 0) + 1);
       }
     });
-    tx();
   }
 
   /**
