@@ -717,6 +717,9 @@ export class RepoMap {
         this.onProgress?.(0, toIndex.length);
         await this.ensureTreeSitter();
         this.dropSecondaryIndexes();
+        // FTS5 triggers fire per INSERT/DELETE — defer and bulk-rebuild after COMMIT.
+        this.db.run("DROP TRIGGER IF EXISTS symbols_ai");
+        this.db.run("DROP TRIGGER IF EXISTS symbols_ad");
         try {
           this.db.run("BEGIN IMMEDIATE");
           for (let i = 0; i < toIndex.length; i++) {
@@ -752,6 +755,7 @@ export class RepoMap {
           throw err;
         } finally {
           this.createSecondaryIndexes();
+          this.rebuildFts();
         }
         this.onProgress?.(toIndex.length, toIndex.length);
       }
