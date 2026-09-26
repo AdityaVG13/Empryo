@@ -50,6 +50,9 @@ const TRIGRAM_MAX_FILE_BYTES = 256 * 1024;
 const CLONE_MAX_LINES = 3000;
 const CLONE_MAX_SYMBOLS = 1500;
 
+/** Kinds that can own nested symbols for qualified_name (tightest enclosing span). */
+const CONTAINER_KINDS = new Set(["class", "interface", "module", "namespace", "enum"]);
+
 /** Non-unique btree indexes from initSchema. PK and files.path UNIQUE stay up during bulk ingest. */
 const SCAN_SECONDARY_INDEXES: readonly { name: string; sql: string }[] = [
   { name: "idx_files_path", sql: "CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)" },
@@ -960,105 +963,88 @@ export class RepoMap {
 
     if (outline) {
       const insertSym = this.db.prepare(
-        "INSERT INTO symbols (file_id, name, kind, line, end_line, is_exported, signature) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO symbols (file_id, name, kind, line, end_line, is_exported, signature, qualified_name, moniker) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       );
       const exportedNames = new Set(outline.exports.map((e) => e.name));
       const seen = new Set<string>();
       const lines = content.split("\n");
 
       const MAX_SYMBOLS_PER_FILE = 10_000;
-      const tx = this.db.transaction(() => {
-        let symbolCount = 0;
-        for (const sym of outline.symbols) {
-          if (symbolCount >= MAX_SYMBOLS_PER_FILE) break;
-          const key = `${sym.name}:${String(sym.location.line)}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
+      const pending: Array<{
+        name: string;
+        kind: string;
+        line: number;
+        endLine: number;
+        exported: number;
+        sig: string | null;
+        qualifiedName: string | null;
+      }> = [];
+      for (const sym of outline.symbols) {
+        if (pending.length >= MAX_SYMBOLS_PER_FILE) break;
+        const key = `${sym.name}:${String(sym.location.line)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
 
-          // Filter local variables: only index top-level symbols.
-          // Variables/constants inside function bodies add noise (9k+ symbols).
-          // Keep: exported, non-variable kinds, or top-level (indentation ≤ 2 spaces).
-          if (sym.kind === "variable" || sym.kind === "constant") {
-            if (!exportedNames.has(sym.name)) {
-              const srcLine = lines[sym.location.line - 1] ?? "";
-              const indent = srcLine.length - srcLine.trimStart().length;
-              if (indent > 2) continue; // local variable — skip
+        // Filter local variables: only index top-level symbols.
+        // Variables/constants inside function bodies add noise (9k+ symbols).
+        // Keep: exported, non-variable kinds, or top-level (indentation ≤ 2 spaces).
+        if (sym.kind === "variable" || sym.kind === "constant") {
+          if (!exportedNames.has(sym.name)) {
+            const srcLine = lines[sym.location.line - 1] ?? "";
+            const indent = srcLine.length - srcLine.trimStart().length;
+            if (indent > 2) continue; // local variable — skip
+          }
+        }
+
+        pending.push({
+          name: sym.name,
+          kind: sym.kind,
+          line: sym.location.line,
+          endLine: sym.location.endLine ?? sym.location.line,
+          exported: exportedNames.has(sym.name) ? 1 : 0,
+          sig: extractSignature(lines, sym.location.line - 1, sym.kind),
+          qualifiedName: null,
+        });
+      }
+
+      // Scope-qualified names from line-range containment (tightest enclosing
+      // container). Top-level stays null. e.g. AgentBus.dispatch
+      const fileSyms = [...pending].sort((a, b) => a.line - b.line);
+      const containers = fileSyms.filter((s) => CONTAINER_KINDS.has(s.kind) && s.endLine > s.line);
+      if (containers.length > 0) {
+        // Smallest span first so the first enclosing match is the tightest.
+        containers.sort((a, b) => a.endLine - a.line - (b.endLine - b.line));
+        for (const sym of fileSyms) {
+          for (const c of containers) {
+            if (c === sym) continue;
+            if (c.line <= sym.line && c.endLine >= sym.endLine) {
+              sym.qualifiedName = `${c.name}.${sym.name}`;
+              break;
             }
           }
+        }
+      }
 
-          const sig = extractSignature(lines, sym.location.line - 1, sym.kind);
+      // Stable SCIP-style monikers: position-independent identity.
+      // Uses qualified_name when present (nested), else the bare name.
+      const mod = relPath.replace(/\.[^./]+$/, "");
+      const tx = this.db.transaction(() => {
+        for (const p of pending) {
+          const descriptor = p.qualifiedName ?? p.name;
           insertSym.run(
             fileId,
-            sym.name,
-            sym.kind,
-            sym.location.line,
-            sym.location.endLine ?? sym.location.line,
-            exportedNames.has(sym.name) ? 1 : 0,
-            sig,
+            p.name,
+            p.kind,
+            p.line,
+            p.endLine,
+            p.exported,
+            p.sig,
+            p.qualifiedName,
+            `${mod}#${descriptor}(${p.kind})`,
           );
-          symbolCount++;
         }
       });
       tx();
-
-      // Compute scope-qualified names from line-range containment
-      // e.g. AgentBus.dispatch, DependencyFailedError (top-level stays unqualified)
-      {
-        const CONTAINER_KINDS = new Set(["class", "interface", "module", "namespace", "enum"]);
-        const fileSyms = this.db
-          .query<
-            { id: number; name: string; kind: string; line: number; end_line: number },
-            [number]
-          >(
-            "SELECT id, name, kind, line, end_line FROM symbols WHERE file_id = ? ORDER BY line ASC",
-          )
-          .all(fileId);
-        const containers = fileSyms.filter(
-          (s) => CONTAINER_KINDS.has(s.kind) && s.end_line > s.line,
-        );
-        if (containers.length > 0) {
-          // Sort containers by span size (smallest first) so the first match
-          // enclosing a symbol is the tightest container — O(n×m) worst case
-          // but early-exit on first match makes it O(n) for typical code.
-          const sorted = [...containers].sort(
-            (a, b) => a.end_line - a.line - (b.end_line - b.line),
-          );
-          const updateQname = this.db.prepare("UPDATE symbols SET qualified_name = ? WHERE id = ?");
-          const qTx = this.db.transaction(() => {
-            for (const sym of fileSyms) {
-              for (const c of sorted) {
-                if (c.id === sym.id) continue;
-                if (c.line <= sym.line && c.end_line >= sym.end_line) {
-                  updateQname.run(`${c.name}.${sym.name}`, sym.id);
-                  break; // smallest span first → first match is tightest
-                }
-              }
-            }
-          });
-          qTx();
-        }
-
-        // Stable SCIP-style monikers: position-independent identity for every
-        // symbol. Uses qualified_name when present (nested), else the bare name.
-        // Survives line moves/reformatting so cochange/recall stay stable.
-        {
-          const mod = relPath.replace(/\.[^./]+$/, "");
-          const rows = this.db
-            .query<
-              { id: number; name: string; kind: string; qualified_name: string | null },
-              [number]
-            >("SELECT id, name, kind, qualified_name FROM symbols WHERE file_id = ?")
-            .all(fileId);
-          const updateMoniker = this.db.prepare("UPDATE symbols SET moniker = ? WHERE id = ?");
-          const mTx = this.db.transaction(() => {
-            for (const r of rows) {
-              const descriptor = r.qualified_name ?? r.name;
-              updateMoniker.run(`${mod}#${descriptor}(${r.kind})`, r.id);
-            }
-          });
-          mTx();
-        }
-      }
 
       // Detect barrel files structurally:
       // A barrel file re-exports from other files with no/minimal original definitions.
