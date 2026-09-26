@@ -96,4 +96,35 @@ describe("stable symbol monikers", () => {
     await repoMap.scan();
     expect(repoMap.resolveMoniker("nonexistent#foo(function)")).toBeNull();
   });
+
+  test("nested symbols use tightest-container qualified_name in the moniker", async () => {
+    writeFileSync(
+      join(dir, "bus.ts"),
+      `export class AgentBus {
+  dispatch() { return 1; }
+}
+export class DependencyFailedError {
+  toString() { return "x"; }
+}
+`,
+    );
+    repoMap = new RepoMap(dir);
+    await repoMap.scan();
+    const db = (repoMap as unknown as { db: { query: (sql: string) => { all: () => unknown[] } } })
+      .db;
+    const rows = db.query("SELECT name, kind, qualified_name, moniker FROM symbols").all() as Array<{
+      name: string;
+      kind: string;
+      qualified_name: string | null;
+      moniker: string | null;
+    }>;
+    const dispatch = rows.find((r) => r.name === "dispatch");
+    expect(dispatch?.qualified_name).toBe("AgentBus.dispatch");
+    expect(dispatch?.moniker).toBe(`bus#AgentBus.dispatch(${dispatch?.kind})`);
+    const agentBus = rows.find((r) => r.name === "AgentBus");
+    expect(agentBus?.qualified_name).toBeNull();
+    expect(agentBus?.moniker).toBe("bus#AgentBus(class)");
+    const err = rows.find((r) => r.name === "DependencyFailedError");
+    expect(err?.qualified_name).toBeNull();
+  });
 });

@@ -45,6 +45,27 @@ import { detectLanguageFromPath } from "./types.js";
  *  Matches ripgrep's --max-filesize=256K cap used by soul_grep. */
 const TRIGRAM_MAX_FILE_BYTES = 256 * 1024;
 
+/** PascalCase + camelCase; `{3,}` rest is length ≥ 4 (JS still drops ≥ 60). */
+const CAMEL_IDENT_RE = /\b([A-Za-z][a-zA-Z0-9_]{3,})\b/g;
+/** PascalCase + snake_case (lowercase ids cannot contain A-Z). */
+const SNAKE_IDENT_RE = /\b([A-Z][a-zA-Z0-9_]{3,}|[a-z][a-z0-9_]{3,})\b/g;
+/** Lisp identifiers including hyphens. */
+const LISP_IDENT_RE = /\b([A-Za-z][a-zA-Z0-9_-]{3,})\b/g;
+
+const SNAKE_IDENT_LANGUAGES: ReadonlySet<Language> = new Set([
+  "python",
+  "ruby",
+  "elixir",
+  "php",
+  "c",
+  "cpp",
+  "zig",
+  "lua",
+  "bash",
+  "ocaml",
+  "rescript",
+]);
+
 /** Clone shape/token hashing is deferred until clone search. Giant files
  *  stay excluded then (serializeShape hotspot on 5k-line ASTs). */
 const CLONE_MAX_LINES = 3000;
@@ -1203,61 +1224,30 @@ export class RepoMap {
 
   private extractIdentifiers(content: string, language: Language): Set<string> {
     const ids = new Set<string>();
-    const patterns: RegExp[] = [];
+    const lisp = language === "elisp";
+    const pattern = lisp
+      ? LISP_IDENT_RE
+      : SNAKE_IDENT_LANGUAGES.has(language)
+        ? SNAKE_IDENT_RE
+        : CAMEL_IDENT_RE;
 
-    switch (language) {
-      // camelCase + PascalCase
-      case "typescript":
-      case "javascript":
-      case "go":
-      case "rust":
-      case "java":
-      case "kotlin":
-      case "swift":
-      case "csharp":
-      case "dart":
-      case "scala":
-      case "objc":
-      case "solidity":
-        patterns.push(/\b([A-Z][a-zA-Z0-9_]*)\b/g);
-        patterns.push(/\b([a-z][a-zA-Z0-9_]{2,})\b/g);
-        break;
-      // snake_case + PascalCase
-      case "python":
-      case "ruby":
-      case "elixir":
-      case "php":
-        patterns.push(/\b([A-Z][a-zA-Z0-9_]*)\b/g);
-        patterns.push(/\b([a-z][a-z0-9_]{2,})\b/g);
-        break;
-      // Primarily snake_case/lowercase
-      case "c":
-      case "cpp":
-      case "zig":
-      case "lua":
-      case "bash":
-      case "ocaml":
-      case "rescript":
-        patterns.push(/\b([A-Z][a-zA-Z0-9_]*)\b/g);
-        patterns.push(/\b([a-z][a-z0-9_]{2,})\b/g);
-        break;
-      // Lisp-family (hyphenated identifiers)
-      case "elisp":
-        patterns.push(/\b([A-Z][a-zA-Z0-9_-]*)\b/g);
-        patterns.push(/\b([a-z][a-zA-Z0-9_-]{2,})\b/g);
-        break;
-      // TLA+, Vue, HTML, CSS, config — PascalCase at minimum
-      default:
-        patterns.push(/\b([A-Z][a-zA-Z0-9_]*)\b/g);
-        patterns.push(/\b([a-z][a-zA-Z0-9_]{2,})\b/g);
-        break;
-    }
-
-    for (const pattern of patterns) {
-      for (const match of content.matchAll(pattern)) {
-        const id = match[1];
-        if (id && id.length > 3 && id.length < 60 && !IDENTIFIER_KEYWORDS.has(id)) {
-          ids.add(id);
+    for (const match of content.matchAll(pattern)) {
+      const id = match[1];
+      if (!id) continue;
+      if (id.length > 3 && id.length < 60 && !IDENTIFIER_KEYWORDS.has(id)) ids.add(id);
+      // Opposite-case hyphen suffix: the second historic regex was a separate greedy scan.
+      if (lisp) {
+        const start = id.charCodeAt(0);
+        const wantUpper = start >= 97 && start <= 122;
+        for (let i = 0; i < id.length - 1; i++) {
+          if (id.charCodeAt(i) !== 45 /* - */) continue;
+          const c = id.charCodeAt(i + 1);
+          if (wantUpper ? c < 65 || c > 90 : c < 97 || c > 122) continue;
+          const suffix = id.slice(i + 1);
+          if (suffix.length > 3 && suffix.length < 60 && !IDENTIFIER_KEYWORDS.has(suffix)) {
+            ids.add(suffix);
+          }
+          break;
         }
       }
     }
