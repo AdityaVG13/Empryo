@@ -85,24 +85,172 @@ const KEYWORDS = new Set([
   "False",
 ]);
 
-const TOKEN_RE =
-  /[a-zA-Z_$]\w*|0[xXbBoO][\da-fA-F_]+|\d[\d_.]*(?:[eE][+-]?\d+)?[fFdDlLuU]?|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`|[^\s\w]/g;
+// TOKEN_RE vocabulary, scanned by char index (no matchAll / exec match objects):
+// /[a-zA-Z_$]\w*|0[xXbBoO][\da-fA-F_]+|\d[\d_.]*(?:[eE][+-]?\d+)?[fFdDlLuU]?|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`|[^\s\w]/g
+const TOK_I = "$I";
+const TOK_S = "$S";
+const TOK_N = "$N";
 
-function normalizeToken(token: string): string {
-  if (token.length === 0) return token;
-  const first = token[0] as string;
-  if (first === '"' || first === "'" || first === "`") return "$S";
-  if (/^\d/.test(token) || /^0[xXbBoO]/.test(token)) return "$N";
-  if (/^[a-zA-Z_$]/.test(token)) {
-    return KEYWORDS.has(token) ? token : "$I";
-  }
-  return token;
+let kwMinLen = 32;
+let kwMaxLen = 0;
+for (const kw of KEYWORDS) {
+  const len = kw.length;
+  if (len < kwMinLen) kwMinLen = len;
+  if (len > kwMaxLen) kwMaxLen = len;
 }
+const KW_MIN_LEN = kwMinLen;
+const KW_MAX_LEN = kwMaxLen;
 
 export function tokenize(source: string): string[] {
+  const n = source.length;
   const tokens: string[] = [];
-  for (const match of source.matchAll(TOKEN_RE)) {
-    tokens.push(normalizeToken(match[0]));
+  let i = 0;
+  while (i < n) {
+    const c = source.charCodeAt(i);
+
+    // \s (ASCII fast path, then Unicode WhiteSpace / LineTerminator)
+    if (c <= 32) {
+      if (c === 32 || (c >= 9 && c <= 13)) {
+        i++;
+        continue;
+      }
+    } else if (c >= 0xa0) {
+      if (
+        c === 0xa0 ||
+        c === 0x1680 ||
+        (c >= 0x2000 && c <= 0x200a) ||
+        c === 0x2028 ||
+        c === 0x2029 ||
+        c === 0x202f ||
+        c === 0x205f ||
+        c === 0x3000 ||
+        c === 0xfeff
+      ) {
+        i++;
+        continue;
+      }
+    }
+
+    // [a-zA-Z_$]\w*
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 36) {
+      const start = i++;
+      while (i < n) {
+        const d = source.charCodeAt(i);
+        if ((d >= 65 && d <= 90) || (d >= 97 && d <= 122) || (d >= 48 && d <= 57) || d === 95) {
+          i++;
+        } else break;
+      }
+      const len = i - start;
+      if (len < KW_MIN_LEN || len > KW_MAX_LEN) {
+        tokens.push(TOK_I);
+      } else {
+        const ident = source.slice(start, i);
+        tokens.push(KEYWORDS.has(ident) ? ident : TOK_I);
+      }
+      continue;
+    }
+
+    // 0[xXbBoO][\da-fA-F_]+  |  \d[\d_.]*(?:[eE][+-]?\d+)?[fFdDlLuU]?
+    if (c >= 48 && c <= 57) {
+      if (c === 48 && i + 2 < n) {
+        const p = source.charCodeAt(i + 1);
+        if (p === 120 || p === 88 || p === 98 || p === 66 || p === 111 || p === 79) {
+          const d = source.charCodeAt(i + 2);
+          if ((d >= 48 && d <= 57) || (d >= 65 && d <= 70) || (d >= 97 && d <= 102) || d === 95) {
+            i += 3;
+            while (i < n) {
+              const h = source.charCodeAt(i);
+              if (
+                (h >= 48 && h <= 57) ||
+                (h >= 65 && h <= 70) ||
+                (h >= 97 && h <= 102) ||
+                h === 95
+              ) {
+                i++;
+              } else break;
+            }
+            tokens.push(TOK_N);
+            continue;
+          }
+        }
+      }
+      i++;
+      while (i < n) {
+        const d = source.charCodeAt(i);
+        if ((d >= 48 && d <= 57) || d === 95 || d === 46) i++;
+        else break;
+      }
+      if (i < n) {
+        const e = source.charCodeAt(i);
+        if (e === 101 || e === 69) {
+          let k = i + 1;
+          if (k < n) {
+            const sign = source.charCodeAt(k);
+            if (sign === 43 || sign === 45) k++;
+          }
+          if (k < n) {
+            const d = source.charCodeAt(k);
+            if (d >= 48 && d <= 57) {
+              k++;
+              while (k < n && source.charCodeAt(k) >= 48 && source.charCodeAt(k) <= 57) k++;
+              i = k;
+            }
+          }
+        }
+      }
+      if (i < n) {
+        const s = source.charCodeAt(i);
+        if (
+          s === 102 ||
+          s === 70 ||
+          s === 100 ||
+          s === 68 ||
+          s === 108 ||
+          s === 76 ||
+          s === 117 ||
+          s === 85
+        ) {
+          i++;
+        }
+      }
+      tokens.push(TOK_N);
+      continue;
+    }
+
+    // "(?:[^"\\]|\\.)*" | '(?:[^'\\]|\\.)*' | `(?:[^`\\]|\\.)*`
+    // `.` does not match U+000A / U+000D / U+2028 / U+2029, so `\\` + those fails the alt.
+    if (c === 34 || c === 39 || c === 96) {
+      let j = i + 1;
+      let closed = false;
+      while (j < n) {
+        const d = source.charCodeAt(j);
+        if (d === c) {
+          closed = true;
+          j++;
+          break;
+        }
+        if (d === 92) {
+          const next = j + 1 < n ? source.charCodeAt(j + 1) : -1;
+          if (next < 0 || next === 10 || next === 13 || next === 0x2028 || next === 0x2029) break;
+          j += 2;
+          continue;
+        }
+        j++;
+      }
+      if (closed) {
+        tokens.push(TOK_S);
+        i = j;
+        continue;
+      }
+      // Failed string alt: `[^\s\w]` takes the opener, and quote-start tokens map to $S.
+      tokens.push(TOK_S);
+      i++;
+      continue;
+    }
+
+    // [^\s\w]
+    tokens.push(source[i] as string);
+    i++;
   }
   return tokens;
 }
@@ -135,9 +283,9 @@ const TOKEN_XXHASH32 = new Map<string, number>();
   const intern = (t: string): void => {
     TOKEN_XXHASH32.set(t, Bun.hash.xxHash32(t) >>> 0);
   };
-  intern("$I");
-  intern("$S");
-  intern("$N");
+  intern(TOK_I);
+  intern(TOK_S);
+  intern(TOK_N);
   for (const kw of KEYWORDS) intern(kw);
 }
 
@@ -149,7 +297,7 @@ export function hashTokensU32(tokens: string[]): Uint32Array {
   for (let i = 0; i < n; i++) {
     const t = tokens[i] as string;
     const hit = intern.get(t);
-    out[i] = hit !== undefined ? hit : (Bun.hash.xxHash32(t) >>> 0);
+    out[i] = hit !== undefined ? hit : Bun.hash.xxHash32(t) >>> 0;
   }
   return out;
 }
