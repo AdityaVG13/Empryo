@@ -838,7 +838,8 @@ export class RepoMap {
       await this.buildCoChanges();
 
       await this.yieldToUi();
-      this.compactIfNeeded();
+      // Warm scan (nothing indexed, nothing stale) — skip WAL checkpoint I/O.
+      if (toIndex.length > 0 || stale.length > 0) this.compactIfNeeded();
       this.ready = true;
       this.onScanComplete?.(true);
     } catch (err) {
