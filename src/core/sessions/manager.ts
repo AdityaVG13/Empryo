@@ -699,10 +699,13 @@ export class SessionManager {
       // Leave the sentinel — the next saveTab reloads from disk.
     }
 
+    // Clone: allMessages/updatedCore hold caller-owned message objects by ref.
+    // Caching the refs would let a caller's later in-place mutation leak into
+    // the next saveTab's splice (stat stays fresh, so no disk reload saves us).
     this.lastWrites.set(sessionId, {
-      meta: updatedMeta,
-      messages: allMessages,
-      core: updatedCore,
+      meta: structuredClone(updatedMeta),
+      messages: structuredClone(allMessages),
+      core: structuredClone(updatedCore),
       metaMtimeMs,
       metaSize,
     });

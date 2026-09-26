@@ -501,4 +501,25 @@ describe("SessionManager.saveTab", () => {
 		expect(loaded!.tabMessages.get("tab-b")![0]!.content).toBe("from-b");
 		expect(loaded!.tabMessages.get("tab-b")![1]!.content).toBe("b-reply");
 	});
+
+	it("mutating caller messages after saveTab does not poison the next splice", async () => {
+		const tabAMessages = [makeMessage("user", "from-a")];
+		await manager.saveTab(SID, makeTab("tab-a"), tabAMessages, undefined, fallback("tab-a"));
+
+		// Caller mutates its own objects after the save resolved.
+		tabAMessages[0]!.content = "MUTATED";
+
+		await manager.saveTab(
+			SID,
+			makeTab("tab-b"),
+			[makeMessage("user", "from-b")],
+			undefined,
+			fallback("tab-b"),
+		);
+
+		const loaded = manager.loadSession(SID);
+		expect(loaded).not.toBeNull();
+		expect(loaded!.tabMessages.get("tab-a")![0]!.content).toBe("from-a");
+		expect(loaded!.tabMessages.get("tab-b")![0]!.content).toBe("from-b");
+	});
 });
