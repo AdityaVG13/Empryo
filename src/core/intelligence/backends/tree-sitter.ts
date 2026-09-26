@@ -1470,8 +1470,8 @@ export class TreeSitterBackend implements IntelligenceBackend {
     const source = content ?? (await this.readFileContent(absPath));
     if (!source || source.length > TreeSitterBackend.MAX_FILE_BYTES) return null;
 
-    // Check tree cache — reuse if content hasn't changed
-    const cached = this.treeCache.get(absPath);
+    // Inline content (scan): parse once, no LRU copy. Disk reads (live router) still cache.
+    const cached = content === undefined ? this.treeCache.get(absPath) : undefined;
     if (cached && cached.content === source) {
       // Return a copy since callers delete the tree
       return cached.tree.copy();
@@ -1495,6 +1495,8 @@ export class TreeSitterBackend implements IntelligenceBackend {
       return null;
     }
     if (!tree) return null;
+
+    if (content !== undefined) return tree;
 
     // Cache the tree (evict oldest if full)
     if (cached) cached.tree.delete();
