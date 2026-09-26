@@ -334,6 +334,16 @@ export interface FileOutline {
   exports: ExportInfo[];
 }
 
+/** Structural hash of one symbol subtree, for clone detection */
+export interface ShapeHash {
+  name: string;
+  kind: string;
+  line: number;
+  endLine: number;
+  shapeHash: string;
+  nodeCount: number;
+}
+
 /** Type information for a symbol */
 export interface TypeInfo {
   symbol: string;
@@ -446,7 +456,7 @@ export interface IntelligenceBackend {
   getFileOutline?(
     file: string,
     opts?: { shapeHashes?: boolean; content?: string },
-  ): Promise<FileOutline | null>;
+  ): Promise<(FileOutline & { shapeHashes?: ShapeHash[] }) | null>;
 
   readSymbol?(file: string, symbolName: string, symbolKind?: SymbolKind): Promise<CodeBlock | null>;
 

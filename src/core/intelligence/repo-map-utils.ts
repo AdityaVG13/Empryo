@@ -399,7 +399,9 @@ async function collectFilesViaGit(dir: string): Promise<CollectedFile[] | null> 
     if (candidates.length === 0) return [];
 
     // Scan UI heartbeat is RepoMap.yieldToUi. Yield only on huge listings.
-    const WAVE = candidates.length > 5000 ? 2000 : candidates.length;
+    // Fixed wave size: thousands of concurrent stats can exhaust fds (EMFILE)
+    // on constrained hosts or network filesystems, silently dropping files.
+    const WAVE = 512;
     const files: CollectedFile[] = [];
 
     for (let i = 0; i < candidates.length; i += WAVE) {

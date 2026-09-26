@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -114,15 +114,30 @@ export class Beta {}
 `,
     );
 
-    const combined = await backend.getFileOutline(f, { shapeHashes: true });
-    const standalone = await backend.getShapeHashes(f);
-    const plain = await backend.getFileOutline(f);
+    // @ts-expect-error — spying a private method for test
+    const parseSpy = spyOn(TreeSitterBackend.prototype, "parseFileSync");
 
-    expect(combined?.symbols).toEqual(plain?.symbols);
-    expect(combined?.imports).toEqual(plain?.imports);
-    expect(combined?.exports).toEqual(plain?.exports);
-    expect("shapeHashes" in (plain ?? {})).toBe(false);
-    expect(combined?.shapeHashes).toEqual(standalone);
-    expect((combined?.shapeHashes?.length ?? 0) + (standalone?.length ?? 0)).toBeGreaterThan(0);
+    try {
+      const combined = await backend.getFileOutline(f, { shapeHashes: true });
+      const standalone = await backend.getShapeHashes(f);
+      const plain = await backend.getFileOutline(f);
+
+      expect(combined?.symbols).toEqual(plain?.symbols);
+      expect(combined?.imports).toEqual(plain?.imports);
+      expect(combined?.exports).toEqual(plain?.exports);
+      expect("shapeHashes" in (plain ?? {})).toBe(false);
+      expect(combined?.shapeHashes).toEqual(standalone);
+      expect((combined?.shapeHashes?.length ?? 0) + (standalone?.length ?? 0)).toBeGreaterThan(0);
+      // One WASM parse serves all three calls via the tree cache.
+      expect(parseSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      parseSpy.mockRestore();
+    }
+  });
+
+  it("outlineFromContent returns null when the grammar is not loaded", () => {
+    const fresh = new TreeSitterBackend();
+
+    expect(fresh.outlineFromContent(join(TMP, "unloaded.ts"), "export const a = 1;\n")).toBeNull();
   });
 });

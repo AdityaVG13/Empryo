@@ -123,7 +123,8 @@ export class DependencyFailedError {
 
     const dispatch = rows.find((r) => r.name === "dispatch");
     expect(dispatch?.qualified_name).toBe("AgentBus.dispatch");
-    expect(dispatch?.moniker).toBe(`bus#AgentBus.dispatch(${dispatch?.kind})`);
+    expect(dispatch?.kind).toBe("method");
+    expect(dispatch?.moniker).toBe("bus#AgentBus.dispatch(method)");
     const agentBus = rows.find((r) => r.name === "AgentBus");
     expect(agentBus?.qualified_name).toBeNull();
     expect(agentBus?.moniker).toBe("bus#AgentBus(class)");

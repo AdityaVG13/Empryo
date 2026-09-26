@@ -321,6 +321,41 @@ describe("SessionManager.saveTab", () => {
 		expect(loaded!.tabMessages.get("tab-a")).toHaveLength(2);
 	});
 
+	it("rename after another instance's tab write preserves that tab", async () => {
+		await manager.saveTab(
+			SID,
+			makeTab("tab-a"),
+			[makeMessage("user", "A1")],
+			undefined,
+			fallback("tab-a"),
+		);
+
+		// Another manager adds a tab our cache doesn't know about.
+		const other = new SessionManager(TEST_DIR);
+		await other.saveTab(
+			SID,
+			makeTab("tab-b"),
+			[makeMessage("user", "B1")],
+			undefined,
+			fallback("tab-b"),
+		);
+
+		// Renaming must not mark our stale cache fresh.
+		expect(manager.renameSession(SID, "Renamed")).toBe(true);
+		await manager.saveTab(
+			SID,
+			makeTab("tab-a"),
+			[makeMessage("user", "A1"), makeMessage("assistant", "A2")],
+			undefined,
+			fallback("tab-a"),
+		);
+
+		const loaded = manager.loadSession(SID);
+		expect(loaded).not.toBeNull();
+		expect(loaded!.meta.tabs.map((t) => t.id).sort()).toEqual(["tab-a", "tab-b"]);
+		expect(loaded!.tabMessages.get("tab-b")).toHaveLength(1);
+	});
+
 	it("concurrent saves from different tabs all land — no tab lost", async () => {
 		await manager.saveSession(
 			makeMeta(SID, [{ id: "tab-a" }, { id: "tab-b" }, { id: "tab-c" }]),

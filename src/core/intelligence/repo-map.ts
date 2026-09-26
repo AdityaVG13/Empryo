@@ -39,7 +39,7 @@ import {
   extractPatternTrigrams,
   MAX_POSTINGS_PER_TRIGRAM,
 } from "./trigram.js";
-import type { Language, SymbolKind } from "./types.js";
+import type { Language, ShapeHash, SymbolKind } from "./types.js";
 import { detectLanguageFromPath } from "./types.js";
 
 /** Files larger than this are excluded from the trigram index (minified/generated).
@@ -4504,7 +4504,7 @@ export class RepoMap {
 
   private persistCloneArtifacts(
     fileId: number,
-    hashes: import("./backends/tree-sitter.js").ShapeHash[] | null | undefined,
+    hashes: ShapeHash[] | null | undefined,
     symbols:
       | Array<{ name: string; kind: string; location: { line: number; endLine?: number } }>
       | undefined,

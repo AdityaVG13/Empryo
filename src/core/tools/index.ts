@@ -80,8 +80,9 @@ let _soulToolWarningEmitted = false;
  * live tool set. Entries are strongly held but reference each set's caches
  * weakly: a cache stays alive exactly while its owning tool set does (the
  * set's execute closures retain it), and entries whose caches died are
- * pruned lazily on dispatch — so dropped sets stop receiving invalidations
- * without leaking entries or listeners.
+ * pruned lazily on dispatch. When a fanout's last target expires, its
+ * subscription pair is unsubscribed and the map entry deleted, so retired
+ * tab keys leave nothing behind.
  */
 interface ToolFileEventTargets {
   fullReadCache: WeakRef<Set<string>>;
@@ -100,7 +101,7 @@ function getToolFileEventFanout(key: string): ToolFileEventFanout {
   if (existing) return existing;
   const fanout: ToolFileEventFanout = { targets: new Set() };
   toolFileEventFanouts.set(key, fanout);
-  onFileEdited((absPath) => {
+  const unsubEdit = onFileEdited((absPath) => {
     let live = false;
 
     for (const t of fanout.targets) {
@@ -117,9 +118,17 @@ function getToolFileEventFanout(key: string): ToolFileEventFanout {
       counts.delete(absPath);
     }
 
+    if (fanout.targets.size === 0) {
+      unsubEdit();
+      unsubCacheReset();
+      toolFileEventFanouts.delete(key);
+
+      return;
+    }
+
     if (live) resetDiffCache();
   });
-  onCacheReset(() => {
+  const unsubCacheReset = onCacheReset(() => {
     let live = false;
 
     for (const t of fanout.targets) {
@@ -134,6 +143,14 @@ function getToolFileEventFanout(key: string): ToolFileEventFanout {
       live = true;
       cache.clear();
       counts.clear();
+    }
+
+    if (fanout.targets.size === 0) {
+      unsubEdit();
+      unsubCacheReset();
+      toolFileEventFanouts.delete(key);
+
+      return;
     }
 
     if (live) resetDiffCache();

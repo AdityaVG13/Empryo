@@ -14,6 +14,7 @@ import {
   type ImportInfo,
   type IntelligenceBackend,
   type Language,
+  type ShapeHash,
   type SymbolInfo,
   type SymbolKind,
 } from "../types.js";
@@ -540,15 +541,6 @@ interface TreeCacheEntry {
   content: string; // content used to parse — invalidate if changed
 }
 
-export interface ShapeHash {
-  name: string;
-  kind: string;
-  line: number;
-  endLine: number;
-  shapeHash: string;
-  nodeCount: number;
-}
-
 export class TreeSitterBackend implements IntelligenceBackend {
   readonly name = "tree-sitter";
   readonly tier = 3;
@@ -898,7 +890,10 @@ export class TreeSitterBackend implements IntelligenceBackend {
     if (!source || source.length > TreeSitterBackend.MAX_FILE_BYTES) return null;
 
     await this.loadLanguage(this.grammarKeyForFile(file));
-    const tree = this.parseFileSync(file, source);
+    // Disk reads (live router) reuse the LRU tree cache; inline content
+    // (scan) parses fresh without a cache copy.
+    const tree =
+      opts?.content === undefined ? await this.parseFile(file) : this.parseFileSync(file, source);
 
     if (!tree) return null;
 
@@ -1586,16 +1581,15 @@ export class TreeSitterBackend implements IntelligenceBackend {
     }
   }
 
-  private async parseFile(file: string, content?: string): Promise<TSTree | null> {
+  private async parseFile(file: string): Promise<TSTree | null> {
     if (!this.parser) return null;
 
     const absPath = resolve(file);
-    const source = content ?? (await this.readFileContent(absPath));
+    const source = await this.readFileContent(absPath);
 
     if (!source || source.length > TreeSitterBackend.MAX_FILE_BYTES) return null;
 
-    // Inline content (scan): parse once, no LRU copy. Disk reads (live router) still cache.
-    const cached = content === undefined ? this.treeCache.get(absPath) : undefined;
+    const cached = this.treeCache.get(absPath);
 
     if (cached && cached.content === source) {
       // Return a copy since callers delete the tree
@@ -1608,8 +1602,6 @@ export class TreeSitterBackend implements IntelligenceBackend {
 
     const tree = this.parseFileSync(file, source);
     if (!tree) return null;
-
-    if (content !== undefined) return tree;
 
     // Cache the tree (evict oldest if full)
     if (cached) cached.tree.delete();

@@ -10,7 +10,11 @@ import { join } from "node:path";
 process.env.SOULFORGE_NO_REPOMAP = "1";
 
 import { MemoryManager } from "../src/core/memory/manager.js";
-import { emitFileEdited, fileEventListenerCount } from "../src/core/tools/file-events.js";
+import {
+  emitCacheReset,
+  emitFileEdited,
+  fileEventListenerCount,
+} from "../src/core/tools/file-events.js";
 import { buildTools } from "../src/core/tools/index.js";
 
 type ReadTool = {
@@ -113,5 +117,60 @@ describe("buildTools file-event listener reuse", () => {
     emitFileEdited(note, "version two\n");
     expect((await readA.execute!({ files: [{ path: note }] })).output).toContain("version two");
     expect((await readB.execute!({ files: [{ path: note }] })).output).toContain("version two");
+  });
+
+  it("retires a tab key's subscription after its tool set is dropped", () => {
+    // Settle global state: collect sets dropped by earlier tests and let
+    // their fanouts retire, so the deltas below are ours alone.
+    Bun.gc(true);
+    emitFileEdited(join(dir, "settle.txt"), "x");
+    const before = fileEventListenerCount();
+
+    let tools: unknown = buildTools(dir, undefined, undefined, {
+      memoryManager: mm,
+      tabId: "tab-gc",
+    });
+    expect(fileEventListenerCount().edit).toBe(before.edit + 1);
+
+    tools = null;
+    Bun.gc(true);
+
+    // Dispatch prunes the expired target and retires the pair.
+    emitFileEdited(join(dir, "gc-probe.txt"), "x");
+    const after = fileEventListenerCount();
+    expect(after.edit).toBe(before.edit);
+    expect(after.cacheReset).toBe(before.cacheReset);
+  });
+
+  it("rebuilt tab set re-reads fresh content after an edit", async () => {
+    const note = join(dir, "rebuild.txt");
+    writeFileSync(note, "version one\n");
+
+    const first = readToolOf(
+      buildTools(dir, undefined, undefined, { memoryManager: mm, tabId: "tab-rebuild" }),
+    );
+    expect((await first.execute!({ files: [{ path: note }] })).output).toContain("version one");
+
+    // Rebuild the tab: the replacement set must inherit invalidation.
+    const second = readToolOf(
+      buildTools(dir, undefined, undefined, { memoryManager: mm, tabId: "tab-rebuild" }),
+    );
+    expect((await second.execute!({ files: [{ path: note }] })).output).toContain("version one");
+
+    writeFileSync(note, "version two\n");
+    emitFileEdited(note, "version two\n");
+    expect((await second.execute!({ files: [{ path: note }] })).output).toContain("version two");
+  });
+
+  it("cache reset clears full-read stubs", async () => {
+    const note = join(dir, "reset.txt");
+    writeFileSync(note, "cached content\n");
+
+    const read = readToolOf(buildTools(dir, undefined, undefined, { memoryManager: mm }));
+    expect((await read.execute!({ files: [{ path: note }] })).output).toContain("cached content");
+    expect((await read.execute!({ files: [{ path: note }] })).output).toContain("Already read");
+
+    emitCacheReset();
+    expect((await read.execute!({ files: [{ path: note }] })).output).toContain("cached content");
   });
 });

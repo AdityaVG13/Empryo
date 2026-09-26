@@ -416,19 +416,11 @@ export class SessionManager {
       const tmp = `${metaPath}.${suffix}.tmp`;
       writeFileSync(tmp, JSON.stringify(meta, null, 2), { encoding: "utf-8", mode: 0o600 });
       safeRename(tmp, metaPath);
-      const cached = this.lastWrites.get(id);
-
-      if (cached) {
-        cached.meta = { ...cached.meta, title: newTitle, customTitle: newTitle };
-
-        try {
-          const stat = statSync(metaPath);
-          cached.metaMtimeMs = stat.mtimeMs;
-          cached.metaSize = stat.size;
-        } catch {
-          this.lastWrites.delete(id);
-        }
-      }
+      // Drop the cached state instead of refreshing its stat: its tabs and
+      // messages may predate another manager's writes, and marking them
+      // fresh would let the next saveTab delete those tabs. The next save
+      // reloads the complete on-disk state.
+      this.lastWrites.delete(id);
       return true;
     } catch {
       return false;
