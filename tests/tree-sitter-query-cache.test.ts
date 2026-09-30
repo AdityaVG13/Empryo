@@ -128,7 +128,7 @@ export class Beta {}
       expect(combined?.imports).toEqual(plain?.imports);
       expect(combined?.exports).toEqual(plain?.exports);
       expect("shapeHashes" in (plain ?? {})).toBe(false);
-      expect(combined?.shapeHashes).toEqual(standalone);
+      expect(combined?.shapeHashes).toEqual(standalone ?? undefined);
       expect((combined?.shapeHashes?.length ?? 0) + (standalone?.length ?? 0)).toBeGreaterThan(0);
       // One WASM parse serves all three calls via the tree cache.
       expect(parseSpy).toHaveBeenCalledTimes(1);
@@ -141,8 +141,10 @@ export class Beta {}
     const first = "export function firstSnapshot() { return 1; }\n";
     const later = "export function laterSnapshot() { return 2; }\n";
     const f = writeTemp("snapshot.ts", first);
-    // @ts-expect-error -- spying a private reader to simulate a file changing between reads
-    const readSpy = spyOn(backend, "readFileContent");
+    const reader = backend as unknown as {
+      readFileContent: (file: string) => Promise<string | null>;
+    };
+    const readSpy = spyOn(reader, "readFileContent");
 
     try {
       readSpy.mockResolvedValueOnce(first).mockResolvedValue(later);

@@ -666,14 +666,22 @@ export class SessionManager {
       tabs: updatedTabs,
     };
 
-    // Freeze the message snapshot before writes yield to caller mutations.
-    const persistedMessages = structuredClone(allMessages);
-    const lines = persistedMessages.map((m) => JSON.stringify(m)).join("\n");
+    // Serialized lines freeze the messages without changing their JSON encoding
+    // (structuredClone turns Buffers into Uint8Arrays). Cache those same values.
+    const messageLines = allMessages.map((m) => JSON.stringify(m));
+    const persistedMessages = messageLines.map((line) => JSON.parse(line) as ChatMessage);
+    const lines = messageLines.join("\n");
+    // Snapshot every serialized payload before the first await. Round-tripping
+    // keeps cached core data in the same JSON representation as a disk reload.
+    const metaJson = JSON.stringify(updatedMeta, null, 2);
+    const coreJson = Object.keys(updatedCore).length > 0 ? JSON.stringify(updatedCore) : null;
+    const persistedMeta = JSON.parse(metaJson) as SessionMeta;
+    const persistedCore = coreJson === null ? {} : (JSON.parse(coreJson) as typeof updatedCore);
     const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const metaTmp = `${metaPath}.${suffix}.tmp`;
     const jsonlTmp = `${jsonlPath}.${suffix}.tmp`;
 
-    await writeFile(metaTmp, JSON.stringify(updatedMeta, null, 2), {
+    await writeFile(metaTmp, metaJson, {
       encoding: "utf-8",
       mode: 0o600,
     });
@@ -681,9 +689,9 @@ export class SessionManager {
     await rename(jsonlTmp, jsonlPath);
     await rename(metaTmp, metaPath);
 
-    if (Object.keys(updatedCore).length > 0) {
+    if (coreJson !== null) {
       const coreTmp = `${corePath}.${suffix}.tmp`;
-      await writeFile(coreTmp, JSON.stringify(updatedCore), { encoding: "utf-8", mode: 0o600 });
+      await writeFile(coreTmp, coreJson, { encoding: "utf-8", mode: 0o600 });
       await rename(coreTmp, corePath);
     }
 
@@ -701,12 +709,11 @@ export class SessionManager {
       // Leave the sentinel — the next saveTab reloads from disk.
     }
 
-    // Publish only after every write succeeds, using the serialized snapshot.
-    // Clone core messages so later caller mutations cannot poison the cache.
+    // Publish only after every write succeeds, using the serialized snapshots.
     this.lastWrites.set(sessionId, {
-      meta: structuredClone(updatedMeta),
+      meta: persistedMeta,
       messages: persistedMessages,
-      core: structuredClone(updatedCore),
+      core: persistedCore,
       metaMtimeMs,
       metaSize,
     });

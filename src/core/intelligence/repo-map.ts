@@ -243,7 +243,6 @@ export class RepoMap {
   onScanComplete: ((success: boolean) => void) | null = null;
   onStaleSymbols: ((count: number) => void) | null = null;
   onError: ((message: string) => void) | null = null;
-  private indexErrors = 0;
   /** File paths included in the last render() output — used by ContextManager for diff detection. */
   lastRenderedPaths: string[] = [];
   /** Packed-trigram → posting-list size. Hydrated once, then maintained on insert/delete. */
@@ -719,7 +718,6 @@ export class RepoMap {
   }
 
   private async doScan(): Promise<void> {
-    this.indexErrors = 0;
     this.scanContents = new Map();
     try {
       const collected = await collectFiles(this.cwd);
@@ -838,19 +836,12 @@ export class RepoMap {
                   this.indexFile(file.absPath, file.relPath, file.mtime, file.language, file.size);
                 });
               } catch (err) {
-                // The file savepoint rolled back; discard its staged cache state too.
-                const previous = existingFiles.get(file.relPath);
-                if (previous) this.fileIdByPath.set(file.relPath, previous.id);
-                else this.fileIdByPath.delete(file.relPath);
-                this.trigramPostingCounts = null;
-                this.scanContents?.delete(file.relPath);
-                this.indexErrors++;
-
-                if (this.indexErrors <= 5) {
-                  this.onError?.(
-                    `Failed to index ${file.relPath}: ${err instanceof Error ? err.message : String(err)}`,
-                  );
-                }
+                this.onError?.(
+                  `Failed to index ${file.relPath}: ${err instanceof Error ? err.message : String(err)}`,
+                );
+                // Abort the batch: post-indexing must not rebuild a failed file
+                // from disk while its symbols still describe the prior snapshot.
+                throw err;
               }
             }
 
@@ -1010,13 +1001,8 @@ export class RepoMap {
     language: Language,
     size = 0,
   ): void {
-    // A skipped read must not leave the prior index partly deleted.
-    let content: string;
-    try {
-      content = readFileSync(absPath, "utf-8");
-    } catch {
-      return;
-    }
+    // Read before touching the prior index; failures abort the scan transaction.
+    const content = readFileSync(absPath, "utf-8");
 
     const existing = this.db
       .query<{ id: number }, [string]>("SELECT id FROM files WHERE path = ?")
@@ -3234,7 +3220,7 @@ export class RepoMap {
       [number]
     >(
       `SELECT id, name, line, end_line FROM symbols
-       WHERE file_id = ? AND kind IN ('function', 'method') AND end_line > line`,
+       WHERE file_id = ? AND kind IN ('function', 'method') AND end_line >= line`,
     );
 
     const resolveCallee = this.db.prepare<{ id: number }, [number, string]>(

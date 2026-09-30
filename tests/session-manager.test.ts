@@ -233,6 +233,18 @@ describe("SessionManager", () => {
 describe("SessionManager.saveTab", () => {
 	let manager: SessionManager;
 	const SID = "app-session-1";
+
+	function mutateDuringWrite(mutate: () => void) {
+		const writer = manager as unknown as {
+			doSaveTab: (...args: Parameters<SessionManager["saveTab"]>) => Promise<void>;
+		};
+		const save = writer.doSaveTab.bind(writer);
+		return spyOn(writer, "doSaveTab").mockImplementation((...args) => {
+			const pending = save(...args);
+			mutate();
+			return pending;
+		});
+	}
 	const fallback = (activeTabId: string) => ({
 		title: "Test",
 		cwd: TEST_DIR,
@@ -504,13 +516,8 @@ describe("SessionManager.saveTab", () => {
 
 	it("mutating messages during saveTab keeps the cache aligned with disk", async () => {
 		const messages = [makeMessage("user", "original")];
-		// @ts-expect-error -- intercept the private writer at its first await
-		const save = manager.doSaveTab.bind(manager);
-		// @ts-expect-error -- spying a private method for deterministic in-flight mutation
-		const saveSpy = spyOn(manager, "doSaveTab").mockImplementation((...args) => {
-			const pending = save(...args);
+		const saveSpy = mutateDuringWrite(() => {
 			messages[0]!.content = "MUTATED DURING WRITE";
-			return pending;
 		});
 
 		try {
@@ -528,6 +535,56 @@ describe("SessionManager.saveTab", () => {
 			fallback("tab-b"),
 		);
 		expect(manager.loadSession(SID)!.tabMessages.get("tab-a")![0]!.content).toBe("original");
+	});
+
+	it("snapshots metadata before writes and keeps later tab saves consistent", async () => {
+		const tab = makeTab("tab-a");
+		tab.tokenUsage.total = 3;
+		const saveSpy = mutateDuringWrite(() => {
+			tab.tokenUsage.total = 999;
+		});
+		try {
+			await manager.saveTab(SID, tab, [makeMessage("user", "A")], undefined, fallback("tab-a"));
+		} finally {
+			saveSpy.mockRestore();
+		}
+		expect(manager.loadSession(SID)!.meta.tabs[0]!.tokenUsage.total).toBe(3);
+		await manager.saveTab(SID, makeTab("tab-b"), [makeMessage("user", "B")], undefined, fallback("tab-b"));
+		expect(manager.loadSession(SID)!.meta.tabs[0]!.tokenUsage.total).toBe(3);
+	});
+
+	it("snapshots core messages before writes and keeps later tab saves consistent", async () => {
+		const core: import("ai").ModelMessage[] = [{ role: "user", content: "original-core" }];
+		const saveSpy = mutateDuringWrite(() => {
+			core[0]!.content = "mutated-core";
+		});
+		try {
+			await manager.saveTab(SID, makeTab("tab-a"), [makeMessage("user", "A")], core, fallback("tab-a"));
+		} finally {
+			saveSpy.mockRestore();
+		}
+		expect(manager.loadSession(SID)!.tabCoreMessages!.get("tab-a")![0]!.content).toBe("original-core");
+		await manager.saveTab(SID, makeTab("tab-b"), [makeMessage("user", "B")], undefined, fallback("tab-b"));
+		expect(manager.loadSession(SID)!.tabCoreMessages!.get("tab-a")![0]!.content).toBe("original-core");
+	});
+
+	it("preserves the JSON representation of binary tool arguments", async () => {
+		const message = makeMessage("assistant", "tool result");
+		message.toolCalls = [{ id: "call", name: "tool", args: { data: Buffer.from([1, 2, 3]) } }];
+		const expected = JSON.parse(JSON.stringify(message)) as ChatMessage;
+		await manager.saveTab(SID, makeTab("tab-a"), [message], undefined, fallback("tab-a"));
+		expect(manager.loadSession(SID)!.tabMessages.get("tab-a")![0]).toEqual(expected);
+		await manager.saveTab(SID, makeTab("tab-b"), [makeMessage("user", "B")], undefined, fallback("tab-b"));
+		expect(manager.loadSession(SID)!.tabMessages.get("tab-a")![0]).toEqual(expected);
+	});
+
+	it("keeps serialized binary core data stable across later tab saves", async () => {
+		const core: import("ai").ModelMessage[] = [{ role: "user", content: [{ type: "file", data: Buffer.from([1, 2, 3]), mediaType: "application/octet-stream" }] }];
+		await manager.saveTab(SID, makeTab("tab-a"), [makeMessage("user", "A")], core, fallback("tab-a"));
+		const corePath = join(TEST_DIR, ".soulforge", "sessions", SID, "core.json");
+		const before = JSON.parse(readFileSync(corePath, "utf-8"));
+		await manager.saveTab(SID, makeTab("tab-b"), [makeMessage("user", "B")], undefined, fallback("tab-b"));
+		expect(JSON.parse(readFileSync(corePath, "utf-8"))).toEqual(before);
 	});
 
 	it("does not publish a last-write cache entry when the core write fails", async () => {

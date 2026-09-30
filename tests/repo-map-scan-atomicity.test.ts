@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { RepoMap } from "../src/core/intelligence/repo-map.js";
+import type { Language } from "../src/core/intelligence/types.js";
 
 const failingSource =
   'import { externalValue } from "example-package";\nexport function failIndex() { return externalValue; }\n';
@@ -30,27 +31,30 @@ describe("RepoMap scan file atomicity", () => {
     return db;
   }
 
-  test("cold scan rolls back a failed file and commits healthy files with sync enabled", async () => {
+  test("cold scan aborts without partial rows and retries with sync enabled", async () => {
     writeFileSync(join(dir, "failed.ts"), failingSource);
     writeFileSync(join(dir, "healthy.ts"), "export function healthy() { return 1; }\n");
     const db = failRefInsertion();
     const errors: string[] = [];
     const scanSync: number[] = [];
     repoMap.onError = (error) => errors.push(error);
-    repoMap.onProgress = () => {
-      if (db.inTransaction) {
-        scanSync.push(
-          db.query<{ synchronous: number }, []>("PRAGMA synchronous").get()!.synchronous,
-        );
-      }
+    const indexer = repoMap as unknown as {
+      indexFile: (path: string, relPath: string, mtime: number, language: Language, size?: number) => void;
     };
-
-    await repoMap.scan();
+    const index = indexer.indexFile.bind(indexer);
+    const indexSpy = spyOn(indexer, "indexFile").mockImplementation((...args) => {
+      scanSync.push(db.query<{ synchronous: number }, []>("PRAGMA synchronous").get()!.synchronous);
+      index(...args);
+    });
+    try {
+      await expect(repoMap.scan()).rejects.toThrow("injected indexing failure");
+    } finally {
+      indexSpy.mockRestore();
+    }
     expect(errors.some((error) => error.includes("Failed to index failed.ts"))).toBe(true);
-    expect(db.query("SELECT path FROM files ORDER BY path").all()).toEqual([
-      { path: "healthy.ts" },
-    ]);
-    expect(repoMap.getFileSymbols("healthy.ts").map((symbol) => symbol.name)).toEqual(["healthy"]);
+    for (const table of ["files", "symbols", "refs", "external_imports", "trigrams", "calls", "edges"]) {
+      expect(db.query(`SELECT * FROM ${table}`).all()).toEqual([]);
+    }
     expect(repoMap.getFileSymbols("failed.ts")).toEqual([]);
     expect(db.query("SELECT * FROM external_imports").all()).toEqual([]);
     expect(
@@ -60,6 +64,12 @@ describe("RepoMap scan file atomicity", () => {
     expect(repoMap.fileIdByPath.has("failed.ts")).toBe(false);
     expect(scanSync.length).toBeGreaterThan(0);
     expect(scanSync.every((sync) => sync === 1)).toBe(true); // NORMAL
+    expect(db.query<{ foreign_keys: number }, []>("PRAGMA foreign_keys").get()!.foreign_keys).toBe(1);
+    db.run("DROP TRIGGER fail_ref");
+    await repoMap.scan();
+    expect(repoMap.getFileSymbols("healthy.ts").map((symbol) => symbol.name)).toEqual(["healthy"]);
+    expect(repoMap.getFileSymbols("failed.ts").map((symbol) => symbol.name)).toEqual(["failIndex"]);
+    expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
   });
 
   test("a failed source read leaves the prior index untouched", async () => {
@@ -68,18 +78,66 @@ describe("RepoMap scan file atomicity", () => {
     await repoMap.scan();
     const before = repoMap.getFileSymbols("failed.ts");
     writeFileSync(file, failingSource);
-    // @ts-expect-error -- simulate the collected path becoming unreadable before indexing
-    const index = repoMap.indexFile.bind(repoMap);
-    // @ts-expect-error -- spying a private method for a deterministic failed read
-    const indexSpy = spyOn(repoMap, "indexFile").mockImplementation((_, ...args) => {
+    const indexer = repoMap as unknown as {
+      indexFile: (path: string, relPath: string, mtime: number, language: Language, size?: number) => void;
+    };
+    const index = indexer.indexFile.bind(indexer);
+    const indexSpy = spyOn(indexer, "indexFile").mockImplementation((_, ...args) => {
       index(join(dir, "missing.ts"), ...args);
     });
     try {
-      await repoMap.scan();
+      await expect(repoMap.scan()).rejects.toThrow("missing.ts");
       expect(repoMap.getFileSymbols("failed.ts")).toEqual(before);
     } finally {
       indexSpy.mockRestore();
     }
+  });
+
+  test("indexes calls from single-line functions", async () => {
+    writeFileSync(join(dir, "callee.ts"), "export function callee() { return 1; }\n");
+    writeFileSync(
+      join(dir, "caller.ts"),
+      'import { callee } from "./callee";\nexport function caller() { return callee(); }\n',
+    );
+    await repoMap.scan();
+    // @ts-expect-error -- inspect the indexed call graph
+    const db = repoMap.db;
+    expect(db.query("SELECT callee_name, line FROM calls").all()).toEqual([{ callee_name: "callee", line: 2 }]);
+  });
+
+  test("preserves calls and symbols when a changed caller fails indexing", async () => {
+    writeFileSync(join(dir, "callee.ts"), "export function callee() { return 1; }\n");
+    writeFileSync(
+      join(dir, "caller.ts"),
+      'import { callee } from "./callee";\nexport function caller() {\n  return callee();\n}\n',
+    );
+    await repoMap.scan();
+    const db = failRefInsertion();
+    const beforeCalls = db.query("SELECT * FROM calls ORDER BY caller_symbol_id, callee_file_id").all();
+    const beforeSymbols = repoMap.getFileSymbols("caller.ts");
+    expect(beforeCalls.length).toBeGreaterThan(0);
+    const scanResults: boolean[] = [];
+    repoMap.onScanComplete = (success) => scanResults.push(success);
+    writeFileSync(
+      join(dir, "caller.ts"),
+      'import { callee } from "./callee";\nexport function failIndex() {\n  return 42;\n}\n',
+    );
+    let scanError: unknown;
+    try {
+      await repoMap.scan();
+    } catch (error) {
+      scanError = error;
+    }
+    expect(db.query("SELECT * FROM calls ORDER BY caller_symbol_id, callee_file_id").all()).toEqual(beforeCalls);
+    expect(repoMap.getFileSymbols("caller.ts")).toEqual(beforeSymbols);
+    expect(scanError).toBeInstanceOf(Error);
+    expect(scanResults).toEqual([false]);
+
+    db.run("DROP TRIGGER fail_ref");
+    await repoMap.scan();
+    expect(repoMap.getFileSymbols("caller.ts").map((symbol) => symbol.name)).toEqual(["failIndex"]);
+    expect(db.query("SELECT * FROM calls").all()).toEqual([]);
+    expect(scanResults).toEqual([false, true]);
   });
 
   test("incremental scan preserves a failed file's prior index", async () => {
@@ -97,7 +155,7 @@ describe("RepoMap scan file atomicity", () => {
     writeFileSync(failed, failingSource);
     writeFileSync(join(dir, "healthy.ts"), "export function healthy() { return 1; }\n");
 
-    await repoMap.scan();
+    await expect(repoMap.scan()).rejects.toThrow("injected indexing failure");
     expect(errors.some((error) => error.includes("Failed to index failed.ts"))).toBe(true);
     expect(
       db.query("SELECT id, mtime_ms, size_bytes FROM files WHERE path = 'failed.ts'").get(),
@@ -111,6 +169,10 @@ describe("RepoMap scan file atomicity", () => {
         .all(),
     ).toEqual(beforeTrigrams);
     expect(db.query("SELECT * FROM external_imports").all()).toEqual([]);
+    expect(repoMap.getFileSymbols("healthy.ts")).toEqual([]);
+    db.run("DROP TRIGGER fail_ref");
+    await repoMap.scan();
     expect(repoMap.getFileSymbols("healthy.ts").map((symbol) => symbol.name)).toEqual(["healthy"]);
+    expect(repoMap.getFileSymbols("failed.ts").map((symbol) => symbol.name)).toEqual(["failIndex"]);
   });
 });
