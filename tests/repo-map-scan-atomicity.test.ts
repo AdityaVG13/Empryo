@@ -105,6 +105,31 @@ describe("RepoMap scan file atomicity", () => {
     expect(db.query("SELECT callee_name, line FROM calls").all()).toEqual([{ callee_name: "callee", line: 2 }]);
   });
 
+  test("excludes synthetic re-exports without excluding real line-one callers", async () => {
+    writeFileSync(join(dir, "callee.ts"), "export function callee() { return 1; }\n");
+    writeFileSync(join(dir, "defs.ts"), "export function forwarded() { return 0; }\n");
+    writeFileSync(
+      join(dir, "barrel.ts"),
+      'import { callee } from "./callee"; export function realCaller() { return callee(); }\nexport * from "./defs";\n',
+    );
+    await repoMap.scan();
+    // @ts-expect-error -- inspect synthetic markers and function-level calls
+    const db = repoMap.db;
+    const synthetic = db
+      .query(
+        "SELECT s.line, s.end_line, s.is_exported, s.signature FROM symbols s JOIN files f ON f.id = s.file_id WHERE f.path = 'barrel.ts' AND s.name = 'forwarded'",
+      )
+      .get();
+    expect(synthetic).toEqual({ line: 1, end_line: 1, is_exported: 1, signature: null });
+    expect(
+      db
+        .query(
+          "SELECT s.name AS caller, c.callee_name, c.line FROM calls c JOIN symbols s ON s.id = c.caller_symbol_id JOIN files f ON f.id = s.file_id WHERE f.path = 'barrel.ts' ORDER BY s.name",
+        )
+        .all(),
+    ).toEqual([{ caller: "realCaller", callee_name: "callee", line: 1 }]);
+  });
+
   test("preserves calls and symbols when a changed caller fails indexing", async () => {
     writeFileSync(join(dir, "callee.ts"), "export function callee() { return 1; }\n");
     writeFileSync(

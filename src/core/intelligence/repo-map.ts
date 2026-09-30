@@ -3215,12 +3215,15 @@ export class RepoMap {
        WHERE r.file_id = ? AND r.source_file_id IS NOT NULL AND r.name != '*'`,
     );
 
+    // Star-export placeholders have no signature or real body; retain genuine
+    // single-line declarations even when they also start on line one.
     const getFunctions = this.db.prepare<
       { id: number; name: string; line: number; end_line: number },
       [number]
     >(
       `SELECT id, name, line, end_line FROM symbols
-       WHERE file_id = ? AND kind IN ('function', 'method') AND end_line >= line`,
+       WHERE file_id = ? AND kind IN ('function', 'method') AND end_line >= line
+         AND NOT (signature IS NULL AND is_exported = 1 AND line = 1 AND end_line = 1)`,
     );
 
     const resolveCallee = this.db.prepare<{ id: number }, [number, string]>(
