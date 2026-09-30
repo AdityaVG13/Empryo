@@ -893,7 +893,9 @@ export class TreeSitterBackend implements IntelligenceBackend {
     // Disk reads (live router) reuse the LRU tree cache; inline content
     // (scan) parses fresh without a cache copy.
     const tree =
-      opts?.content === undefined ? await this.parseFile(file) : this.parseFileSync(file, source);
+      opts?.content === undefined
+        ? await this.parseFile(file, source)
+        : this.parseFileSync(file, source);
 
     if (!tree) return null;
 
@@ -1581,11 +1583,11 @@ export class TreeSitterBackend implements IntelligenceBackend {
     }
   }
 
-  private async parseFile(file: string): Promise<TSTree | null> {
+  private async parseFile(file: string, content?: string): Promise<TSTree | null> {
     if (!this.parser) return null;
 
     const absPath = resolve(file);
-    const source = await this.readFileContent(absPath);
+    const source = content ?? (await this.readFileContent(absPath));
 
     if (!source || source.length > TreeSitterBackend.MAX_FILE_BYTES) return null;
 

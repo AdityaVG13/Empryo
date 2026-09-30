@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SessionManager } from "../src/core/sessions/manager.js";
@@ -500,6 +500,59 @@ describe("SessionManager.saveTab", () => {
 		expect(loaded!.tabMessages.get("tab-b")).toHaveLength(2);
 		expect(loaded!.tabMessages.get("tab-b")![0]!.content).toBe("from-b");
 		expect(loaded!.tabMessages.get("tab-b")![1]!.content).toBe("b-reply");
+	});
+
+	it("mutating messages during saveTab keeps the cache aligned with disk", async () => {
+		const messages = [makeMessage("user", "original")];
+		// @ts-expect-error -- intercept the private writer at its first await
+		const save = manager.doSaveTab.bind(manager);
+		// @ts-expect-error -- spying a private method for deterministic in-flight mutation
+		const saveSpy = spyOn(manager, "doSaveTab").mockImplementation((...args) => {
+			const pending = save(...args);
+			messages[0]!.content = "MUTATED DURING WRITE";
+			return pending;
+		});
+
+		try {
+			await manager.saveTab(SID, makeTab("tab-a"), messages, undefined, fallback("tab-a"));
+		} finally {
+			saveSpy.mockRestore();
+		}
+		expect(manager.loadSession(SID)!.tabMessages.get("tab-a")![0]!.content).toBe("original");
+
+		await manager.saveTab(
+			SID,
+			makeTab("tab-b"),
+			[makeMessage("user", "from-b")],
+			undefined,
+			fallback("tab-b"),
+		);
+		expect(manager.loadSession(SID)!.tabMessages.get("tab-a")![0]!.content).toBe("original");
+	});
+
+	it("does not publish a last-write cache entry when the core write fails", async () => {
+		await manager.saveTab(
+			SID,
+			makeTab("tab-a"),
+			[makeMessage("user", "original")],
+			undefined,
+			fallback("tab-a"),
+		);
+		// @ts-expect-error -- inspect the private last-successful-write cache
+		const cache = manager.lastWrites;
+		const previous = cache.get(SID);
+		// A directory at the destination makes the final core.json rename fail.
+		mkdirSync(join(TEST_DIR, ".soulforge", "sessions", SID, "core.json"));
+		await expect(
+			manager.saveTab(
+				SID,
+				makeTab("tab-a"),
+				[makeMessage("user", "new message")],
+				[{ role: "user", content: "core message" }],
+				fallback("tab-a"),
+			),
+		).rejects.toThrow();
+		expect(cache.get(SID)).toBe(previous);
 	});
 
 	it("mutating caller messages after saveTab does not poison the next splice", async () => {

@@ -666,7 +666,9 @@ export class SessionManager {
       tabs: updatedTabs,
     };
 
-    const lines = allMessages.map((m) => JSON.stringify(m)).join("\n");
+    // Freeze the message snapshot before writes yield to caller mutations.
+    const persistedMessages = structuredClone(allMessages);
+    const lines = persistedMessages.map((m) => JSON.stringify(m)).join("\n");
     const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const metaTmp = `${metaPath}.${suffix}.tmp`;
     const jsonlTmp = `${jsonlPath}.${suffix}.tmp`;
@@ -699,12 +701,11 @@ export class SessionManager {
       // Leave the sentinel — the next saveTab reloads from disk.
     }
 
-    // Clone: allMessages/updatedCore hold caller-owned message objects by ref.
-    // Caching the refs would let a caller's later in-place mutation leak into
-    // the next saveTab's splice (stat stays fresh, so no disk reload saves us).
+    // Publish only after every write succeeds, using the serialized snapshot.
+    // Clone core messages so later caller mutations cannot poison the cache.
     this.lastWrites.set(sessionId, {
       meta: structuredClone(updatedMeta),
-      messages: structuredClone(allMessages),
+      messages: persistedMessages,
       core: structuredClone(updatedCore),
       metaMtimeMs,
       metaSize,

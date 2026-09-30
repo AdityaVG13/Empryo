@@ -137,6 +137,30 @@ export class Beta {}
     }
   });
 
+  it("disk outlines parse and cache the source snapshot read for the outline", async () => {
+    const first = "export function firstSnapshot() { return 1; }\n";
+    const later = "export function laterSnapshot() { return 2; }\n";
+    const f = writeTemp("snapshot.ts", first);
+    // @ts-expect-error -- spying a private reader to simulate a file changing between reads
+    const readSpy = spyOn(backend, "readFileContent");
+
+    try {
+      readSpy.mockResolvedValueOnce(first).mockResolvedValue(later);
+      const outline = await backend.getFileOutline(f);
+      expect(readSpy).toHaveBeenCalledTimes(1);
+      expect([...new Set(outline?.symbols.map((s) => s.name))]).toEqual(["firstSnapshot"]);
+      expect(outline?.exports.map((e) => e.name)).toEqual(["firstSnapshot"]);
+
+      // The next call must observe the new content, not reuse the old cached tree.
+      const updated = await backend.getFileOutline(f);
+      expect(readSpy).toHaveBeenCalledTimes(2);
+      expect([...new Set(updated?.symbols.map((s) => s.name))]).toEqual(["laterSnapshot"]);
+      expect(updated?.exports.map((e) => e.name)).toEqual(["laterSnapshot"]);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
   it("outlineFromContent returns null when the grammar is not loaded", () => {
     const fresh = new TreeSitterBackend();
 

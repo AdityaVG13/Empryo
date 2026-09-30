@@ -254,8 +254,6 @@ export class RepoMap {
   private fileIdByPath = new Map<string, number>();
   /** Coalesce concurrent clone-search fills after a scan that skipped hashing. */
   private cloneFillInflight: Promise<void> | null = null;
-  /** True while doScan holds BEGIN IMMEDIATE — skip inner SAVEPOINTs. */
-  private bulkIngest = false;
   /** Cached: any paid LLM summary rows exist. Null until probed this scan. */
   private hasLlmSummaries: boolean | null = null;
   private stmtInsertSym: Statement | null = null;
@@ -684,14 +682,8 @@ export class RepoMap {
     return new Promise((r) => setTimeout(r, 1));
   }
 
-  /** Nested bun transactions are SAVEPOINTs; skip them inside bulk BEGIN. */
+  /** Nested Bun transactions use SAVEPOINTs, including inside the scan BEGIN. */
   private runInTx(fn: () => void): void {
-    if (this.bulkIngest) {
-      fn();
-
-      return;
-    }
-
     this.db.transaction(fn)();
   }
 
@@ -827,8 +819,7 @@ export class RepoMap {
         }
         // FK checks on every child INSERT; we already delete children explicitly.
         this.db.run("PRAGMA foreign_keys = OFF");
-        this.db.run("PRAGMA synchronous = OFF");
-        this.bulkIngest = true;
+        this.db.run("PRAGMA synchronous = NORMAL");
         this.hasLlmSummaries = null;
 
         if (this.treeSitter) {
@@ -843,8 +834,16 @@ export class RepoMap {
 
             if (file) {
               try {
-                this.indexFile(file.absPath, file.relPath, file.mtime, file.language, file.size);
+                this.runInTx(() => {
+                  this.indexFile(file.absPath, file.relPath, file.mtime, file.language, file.size);
+                });
               } catch (err) {
+                // The file savepoint rolled back; discard its staged cache state too.
+                const previous = existingFiles.get(file.relPath);
+                if (previous) this.fileIdByPath.set(file.relPath, previous.id);
+                else this.fileIdByPath.delete(file.relPath);
+                this.trigramPostingCounts = null;
+                this.scanContents?.delete(file.relPath);
                 this.indexErrors++;
 
                 if (this.indexErrors <= 5) {
@@ -872,8 +871,6 @@ export class RepoMap {
           this.trigramPostingCounts = null;
           throw err;
         } finally {
-          this.bulkIngest = false;
-
           if (bulk) {
             this.createSecondaryIndexes();
             this.rebuildFts();
@@ -1013,6 +1010,14 @@ export class RepoMap {
     language: Language,
     size = 0,
   ): void {
+    // A skipped read must not leave the prior index partly deleted.
+    let content: string;
+    try {
+      content = readFileSync(absPath, "utf-8");
+    } catch {
+      return;
+    }
+
     const existing = this.db
       .query<{ id: number }, [string]>("SELECT id FROM files WHERE path = ?")
       .get(relPath);
@@ -1036,13 +1041,6 @@ export class RepoMap {
           .query("DELETE FROM edges WHERE source_file_id = ? OR target_file_id = ?")
           .run(existing.id, existing.id);
       });
-    }
-
-    let content: string;
-    try {
-      content = readFileSync(absPath, "utf-8");
-    } catch {
-      return;
     }
 
     this.scanContents?.set(relPath, content);
